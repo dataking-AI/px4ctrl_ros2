@@ -1,0 +1,38 @@
+px4_ctrl_node:
+  ros__parameters:
+    mass: 0.5
+    gra: 9.81
+    pose_solver: 1
+    ctrl_freq_max: 100.0
+    use_bodyrate_ctrl: false
+    max_manual_vel: 1.0
+    max_angle: 30.0
+    low_voltage: 14.0
+    hover_percentage: 0.40
+    accurate_thrust_model: false
+    thrust_model_print_value: false
+    thrust_model_k1: 0.7583
+    thrust_model_k2: 1.6942
+    thrust_model_k3: 0.6786
+    rotor_drag_x: 0.0
+    rotor_drag_y: 0.0
+    rotor_drag_z: 0.0
+    rotor_drag_k_thrust_horz: 0.0
+    kp: [2.0, 2.0, 1.8]
+    kv: [2.0, 2.0, 2.0]
+    kang: [12.0, 12.0, 4.0]
+    msg_timeout_odom: 0.5
+    msg_timeout_rc: 0.5
+    msg_timeout_cmd: 0.5
+    msg_timeout_bat: 0.5
+    rc_reverse_roll: false
+    rc_reverse_pitch: false
+    rc_reverse_yaw: false
+    rc_reverse_throttle: true
+    enable_offboard_command: false
+    enable_auto_arm: false
+    enable_auto_takeoff_land: false
+    takeoff_height: 1.0
+    takeoff_land_speed: 0.14
+    publish_debug_odom: true
+    verbose: false
