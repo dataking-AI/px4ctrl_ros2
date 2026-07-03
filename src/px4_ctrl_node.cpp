@@ -41,6 +41,7 @@ constexpr double kCommandModeThreshold = 0.75;
 constexpr double kRebootThreshold = 0.5;
 constexpr uint8_t kTakeoffCommand = 1;
 constexpr uint8_t kLandCommand = 2;
+constexpr double kMinOdomDt = 1.0e-3;
 
 double apply_dead_zone(double value)
 {
@@ -164,6 +165,7 @@ private:
   using InputRc = px4_msgs::msg::InputRc;
   using ManualControlSetpoint = px4_msgs::msg::ManualControlSetpoint;
   using OffboardControlMode = px4_msgs::msg::OffboardControlMode;
+  using Odometry = nav_msgs::msg::Odometry;
   using PositionCommand = quadrotor_msgs::msg::PositionCommand;
   using PoseStamped = geometry_msgs::msg::PoseStamped;
   using UInt8 = std_msgs::msg::UInt8;
@@ -198,8 +200,10 @@ private:
   rclcpp::Publisher<VehicleAttitudeSetpoint>::SharedPtr attitude_setpoint_pub_;
   rclcpp::Publisher<VehicleRatesSetpoint>::SharedPtr rates_setpoint_pub_;
   rclcpp::Publisher<PoseStamped>::SharedPtr planner_trigger_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr planner_odom_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr debug_odom_pub_;
   rclcpp::Subscription<VehicleOdometry>::SharedPtr vehicle_odometry_sub_;
+  rclcpp::Subscription<Odometry>::SharedPtr nav_odom_sub_;
   rclcpp::Subscription<VehicleStatus>::SharedPtr vehicle_status_sub_;
   rclcpp::Subscription<VehicleStatus>::SharedPtr vehicle_status_fallback_sub_;
   rclcpp::Subscription<ManualControlSetpoint>::SharedPtr manual_control_sub_;
@@ -230,12 +234,15 @@ private:
   bool planner_trigger_sent_for_command_{false};
   bool offboard_requested_{false};
   bool arm_requested_{false};
+  bool hover_stable_started_{false};
   bool rc_required_{true};
   bool enable_offboard_command_{false};
   bool enable_auto_arm_{false};
   bool enable_auto_takeoff_land_{false};
   bool auto_start_planner_{false};
+  bool publish_planner_odom_{true};
   bool publish_debug_odom_{true};
+  bool estimate_nav_odom_velocity_{false};
   bool verbose_{false};
   bool reverse_roll_{false};
   bool reverse_pitch_{false};
@@ -245,13 +252,24 @@ private:
   double msg_timeout_rc_{0.5};
   double msg_timeout_cmd_{0.5};
   double msg_timeout_bat_{0.5};
+  double hover_stable_pos_tol_{0.30};
+  double hover_stable_vel_tol_{0.30};
+  double hover_stable_time_{1.0};
   double takeoff_height_{1.0};
   double takeoff_land_speed_{0.14};
   double battery_voltage_{14.0};
   uint64_t offboard_setpoint_counter_{0};
+  uint32_t active_planner_traj_id_{0};
+  uint32_t completed_planner_traj_id_{0};
   uint8_t takeoff_land_command_{0};
   Eigen::Vector3d hover_position_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d last_nav_odom_position_{Eigen::Vector3d::Zero()};
   double hover_yaw_{0.0};
+  std::string odom_source_{"px4"};
+  std::string odom_frame_id_{"world"};
+  std::string odom_child_frame_id_{"base_link"};
+  rclcpp::Time last_nav_odom_stamp_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time hover_stable_start_time_{0, 0, RCL_ROS_TIME};
 
   ControlParams read_control_params()
   {
@@ -281,6 +299,8 @@ private:
     params.kp = read_vector3_param("kp", params.kp);
     params.kv = read_vector3_param("kv", params.kv);
     params.kang = read_vector3_param("kang", params.kang);
+    params.pos_error_limit = declare_parameter<double>("pos_error_limit", params.pos_error_limit);
+    params.vel_error_limit = declare_parameter<double>("vel_error_limit", params.vel_error_limit);
     return params;
   }
 
@@ -300,6 +320,20 @@ private:
     enable_auto_takeoff_land_ =
       declare_parameter<bool>("enable_auto_takeoff_land", enable_auto_takeoff_land_);
     auto_start_planner_ = declare_parameter<bool>("auto_start_planner", auto_start_planner_);
+    odom_source_ = declare_parameter<std::string>("odom_source", odom_source_);
+    if (odom_source_ != "px4" && odom_source_ != "nav") {
+      RCLCPP_WARN(
+        get_logger(),
+        "[px4_ctrl_ros2] unsupported odom_source '%s'; using px4",
+        odom_source_.c_str());
+      odom_source_ = "px4";
+    }
+    estimate_nav_odom_velocity_ =
+      declare_parameter<bool>("estimate_nav_odom_velocity", estimate_nav_odom_velocity_);
+    publish_planner_odom_ = declare_parameter<bool>("publish_planner_odom", publish_planner_odom_);
+    hover_stable_pos_tol_ = declare_parameter<double>("hover_stable_pos_tol", hover_stable_pos_tol_);
+    hover_stable_vel_tol_ = declare_parameter<double>("hover_stable_vel_tol", hover_stable_vel_tol_);
+    hover_stable_time_ = declare_parameter<double>("hover_stable_time", hover_stable_time_);
     takeoff_height_ = declare_parameter<double>("takeoff_height", takeoff_height_);
     takeoff_land_speed_ = declare_parameter<double>("takeoff_land_speed", takeoff_land_speed_);
     publish_debug_odom_ = declare_parameter<bool>("publish_debug_odom", publish_debug_odom_);
@@ -333,12 +367,20 @@ private:
     rates_setpoint_pub_ =
       create_publisher<VehicleRatesSetpoint>("px4/in/vehicle_rates_setpoint", 10);
     planner_trigger_pub_ = create_publisher<PoseStamped>("ego/traj_start_trigger", 10);
+    planner_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("ego/odom_world", 10);
     debug_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("px4ctrl/debug_odom_enu", 10);
 
-    vehicle_odometry_sub_ = create_subscription<VehicleOdometry>(
-      "px4/out/vehicle_odometry",
-      px4_out_qos,
-      std::bind(&Px4CtrlNode::vehicle_odometry_callback, this, std::placeholders::_1));
+    if (odom_source_ == "nav") {
+      nav_odom_sub_ = create_subscription<Odometry>(
+        "nav/odom",
+        rclcpp::QoS(20),
+        std::bind(&Px4CtrlNode::nav_odometry_callback, this, std::placeholders::_1));
+    } else {
+      vehicle_odometry_sub_ = create_subscription<VehicleOdometry>(
+        "px4/out/vehicle_odometry",
+        px4_out_qos,
+        std::bind(&Px4CtrlNode::vehicle_odometry_callback, this, std::placeholders::_1));
+    }
     vehicle_status_sub_ = create_subscription<VehicleStatus>(
       "px4/out/vehicle_status_v1",
       px4_out_qos,
@@ -375,7 +417,7 @@ private:
 
   void control_loop()
   {
-    publish_debug_odometry();
+    publish_odometry_outputs();
     log_diagnostics();
 
     if (!odom_ready()) {
@@ -443,20 +485,22 @@ private:
     }
 
     update_hover_from_rc(dt);
+    publish_control(make_hover_desired());
 
     const bool command_authorized = !rc_required_ || rc_.is_command_mode;
-    if (rc_.enter_command_mode ||
-      (!rc_required_ && auto_start_planner_ && !planner_trigger_sent_for_command_)) {
-      planner_trigger_sent_for_command_ = false;
+    const bool should_trigger_planner =
+      (rc_required_ && rc_.is_command_mode) ||
+      (!rc_required_ && auto_start_planner_);
+    const bool hover_stable = hover_is_stable();
+    if (command_authorized && should_trigger_planner && hover_stable && !planner_trigger_sent_for_command_) {
       trigger_planner_once();
     }
 
     if (command_authorized && planner_cmd_ready()) {
+      active_planner_traj_id_ = planner_cmd_.trajectory_id;
       transition_to(FlightState::CMD_CTRL, "fresh PositionCommand with RC command authorization");
       return;
     }
-
-    publish_control(make_hover_desired());
   }
 
   void handle_cmd_ctrl_state(double dt)
@@ -469,18 +513,20 @@ private:
       transition_to(FlightState::AUTO_HOVER, "RC command switch released");
       return;
     }
+    if (planner_cmd_completed()) {
+      completed_planner_traj_id_ = planner_cmd_.trajectory_id;
+      set_hover_from_current(0.0);
+      transition_to(FlightState::AUTO_HOVER, "planner trajectory completed");
+      return;
+    }
     if (!planner_cmd_ready()) {
+      set_hover_from_current(0.0);
       transition_to(FlightState::AUTO_HOVER, "PositionCommand timeout or invalid");
       return;
     }
 
     update_hover_from_rc(dt);
     publish_control(planner_des_);
-
-    if (planner_cmd_.trajectory_flag == PositionCommand::TRAJECTORY_STATUS_COMPLETED) {
-      set_hover_from_desired(planner_des_);
-      transition_to(FlightState::AUTO_HOVER, "planner trajectory completed");
-    }
   }
 
   void handle_auto_takeoff_state(double dt)
@@ -543,6 +589,14 @@ private:
 
     publish_offboard_control_mode();
     const auto output = controller_.update_alg1(des, odom_, battery_voltage_);
+    if (!control_output_is_finite(output)) {
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(),
+        *get_clock(),
+        1000,
+        "[px4_ctrl_ros2] controller output is non-finite; skip setpoint");
+      return;
+    }
     const double thrust = std::clamp(output.thrust, 0.0, 1.0);
 
     if (params_.use_bodyrate_ctrl) {
@@ -658,6 +712,8 @@ private:
     hover_position_.z() += z_offset;
     hover_yaw_ = yaw_from_quaternion(odom_.q);
     planner_trigger_sent_for_command_ = false;
+    hover_stable_started_ = false;
+    active_planner_traj_id_ = 0;
     controller_.reset_thrust_mapping();
   }
 
@@ -695,6 +751,7 @@ private:
     last_offboard_request_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
     last_arm_request_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
     planner_trigger_sent_for_command_ = false;
+    hover_stable_started_ = false;
   }
 
   bool odom_ready()
@@ -731,7 +788,27 @@ private:
   {
     return have_cmd_ &&
       (now() - last_cmd_time_).seconds() < msg_timeout_cmd_ &&
-      position_cmd_is_valid(planner_cmd_);
+      position_cmd_is_trackable(planner_cmd_) &&
+      planner_cmd_.trajectory_id > 0 &&
+      planner_cmd_.trajectory_id != completed_planner_traj_id_;
+  }
+
+  bool planner_cmd_completed()
+  {
+    return have_cmd_ &&
+      (now() - last_cmd_time_).seconds() < msg_timeout_cmd_ &&
+      planner_cmd_.trajectory_flag == PositionCommand::TRAJECTORY_STATUS_COMPLETED &&
+      planner_cmd_.trajectory_id == active_planner_traj_id_;
+  }
+
+  bool control_output_is_finite(const ControllerOutput &output) const
+  {
+    return std::isfinite(output.q.w()) &&
+      std::isfinite(output.q.x()) &&
+      std::isfinite(output.q.y()) &&
+      std::isfinite(output.q.z()) &&
+      finite_vector3(output.bodyrates) &&
+      std::isfinite(output.thrust);
   }
 
   bool vehicle_is_offboard()
@@ -744,7 +821,7 @@ private:
     return status_ready() && vehicle_status_.arming_state == VehicleStatus::ARMING_STATE_ARMED;
   }
 
-  bool position_cmd_is_valid(const PositionCommand &msg) const
+  bool position_cmd_is_trackable(const PositionCommand &msg) const
   {
     return msg.trajectory_flag == PositionCommand::TRAJECTORY_STATUS_READY &&
       std::isfinite(msg.position.x) &&
@@ -758,6 +835,35 @@ private:
       std::isfinite(msg.acceleration.z) &&
       std::isfinite(msg.yaw) &&
       std::isfinite(msg.yaw_dot);
+  }
+
+  bool hover_is_stable()
+  {
+    if (!odom_ready()) {
+      hover_stable_started_ = false;
+      return false;
+    }
+
+    if (enable_offboard_command_ && (!vehicle_is_offboard() || !vehicle_is_armed())) {
+      hover_stable_started_ = false;
+      return false;
+    }
+
+    const double position_error = (odom_.p - hover_position_).norm();
+    const double velocity_norm = odom_.v.norm();
+    if (position_error > hover_stable_pos_tol_ || velocity_norm > hover_stable_vel_tol_) {
+      hover_stable_started_ = false;
+      return false;
+    }
+
+    const auto current_time = now();
+    if (!hover_stable_started_) {
+      hover_stable_started_ = true;
+      hover_stable_start_time_ = current_time;
+      return false;
+    }
+
+    return (current_time - hover_stable_start_time_).seconds() >= hover_stable_time_;
   }
 
   void transition_to(FlightState next, const char *reason)
@@ -810,6 +916,57 @@ private:
       -msg->angular_velocity[2]);
     have_odom_ = true;
     last_odom_time_ = now();
+    odom_frame_id_ = "world";
+    odom_child_frame_id_ = "base_link";
+  }
+
+  void nav_odometry_callback(const Odometry::SharedPtr msg)
+  {
+    const Eigen::Vector3d p(
+      msg->pose.pose.position.x,
+      msg->pose.pose.position.y,
+      msg->pose.pose.position.z);
+    Eigen::Vector3d v(
+      msg->twist.twist.linear.x,
+      msg->twist.twist.linear.y,
+      msg->twist.twist.linear.z);
+    const Eigen::Quaterniond q(
+      msg->pose.pose.orientation.w,
+      msg->pose.pose.orientation.x,
+      msg->pose.pose.orientation.y,
+      msg->pose.pose.orientation.z);
+    const Eigen::Vector3d w(
+      msg->twist.twist.angular.x,
+      msg->twist.twist.angular.y,
+      msg->twist.twist.angular.z);
+
+    if (!finite_vector3(p) || !finite_vector3(v) || !finite_vector3(w) ||
+      !std::isfinite(q.w()) || !std::isfinite(q.x()) ||
+      !std::isfinite(q.y()) || !std::isfinite(q.z()) ||
+      q.norm() < 1.0e-6) {
+      return;
+    }
+
+    const rclcpp::Time msg_time =
+      msg->header.stamp.sec == 0 && msg->header.stamp.nanosec == 0 ?
+      now() : rclcpp::Time(msg->header.stamp);
+    if (estimate_nav_odom_velocity_ && have_odom_) {
+      const double dt = (msg_time - last_nav_odom_stamp_).seconds();
+      if (dt > kMinOdomDt) {
+        v = (p - last_nav_odom_position_) / dt;
+      }
+    }
+
+    odom_.p = p;
+    odom_.v = v;
+    odom_.q = q.normalized();
+    odom_.w = w;
+    have_odom_ = true;
+    last_odom_time_ = now();
+    last_nav_odom_stamp_ = msg_time;
+    last_nav_odom_position_ = p;
+    odom_frame_id_ = msg->header.frame_id.empty() ? "world" : msg->header.frame_id;
+    odom_child_frame_id_ = msg->child_frame_id.empty() ? "base_link" : msg->child_frame_id;
   }
 
   void vehicle_status_callback(const VehicleStatus::SharedPtr msg)
@@ -897,15 +1054,12 @@ private:
     RCLCPP_INFO(get_logger(), "[px4_ctrl_ros2] takeoff_land command received: %u", msg->data);
   }
 
-  void publish_debug_odometry()
+  nav_msgs::msg::Odometry make_odom_msg()
   {
-    if (!publish_debug_odom_ || !have_odom_) {
-      return;
-    }
     nav_msgs::msg::Odometry msg{};
     msg.header.stamp = now();
-    msg.header.frame_id = "world";
-    msg.child_frame_id = "base_link";
+    msg.header.frame_id = odom_frame_id_;
+    msg.child_frame_id = odom_child_frame_id_;
     msg.pose.pose.position.x = odom_.p.x();
     msg.pose.pose.position.y = odom_.p.y();
     msg.pose.pose.position.z = odom_.p.z();
@@ -916,7 +1070,22 @@ private:
     msg.twist.twist.angular.x = odom_.w.x();
     msg.twist.twist.angular.y = odom_.w.y();
     msg.twist.twist.angular.z = odom_.w.z();
-    debug_odom_pub_->publish(msg);
+    return msg;
+  }
+
+  void publish_odometry_outputs()
+  {
+    if (!have_odom_) {
+      return;
+    }
+
+    const auto msg = make_odom_msg();
+    if (publish_planner_odom_) {
+      planner_odom_pub_->publish(msg);
+    }
+    if (publish_debug_odom_) {
+      debug_odom_pub_->publish(msg);
+    }
   }
 
   void log_diagnostics()
@@ -926,9 +1095,10 @@ private:
       get_logger(),
       *get_clock(),
       throttle_ms,
-      "[px4_ctrl_ros2] state=%s output=%s | px4(nav=%u arm=%u offboard=%s armed=%s) | odom=%s status=%s rc=%s cmd=%s bat=%s | rc(mode=%.2f gear=%.2f hover=%s cmd=%s) | pos=%.2f %.2f %.2f hover=%.2f %.2f %.2f",
+      "[px4_ctrl_ros2] state=%s output=%s odom_source=%s | px4(nav=%u arm=%u offboard=%s armed=%s) | odom=%s status=%s rc=%s cmd=%s bat=%s | rc(mode=%.2f gear=%.2f hover=%s cmd=%s) | pos=%.2f %.2f %.2f hover=%.2f %.2f %.2f err=%.2f vel=%.2f stable=%s traj=%u/%u | ctrl(thr=%.2f acc_xy=%.2f pid_xy=%.2f vdes_xy=%.2f)",
       state_name(state_),
       yes_no(enable_offboard_command_),
+      odom_source_.c_str(),
       have_status_ ? static_cast<unsigned>(vehicle_status_.nav_state) : 255U,
       have_status_ ? static_cast<unsigned>(vehicle_status_.arming_state) : 255U,
       yes_no(vehicle_is_offboard()),
@@ -947,7 +1117,16 @@ private:
       odom_.p.z(),
       hover_position_.x(),
       hover_position_.y(),
-      hover_position_.z());
+      hover_position_.z(),
+      (odom_.p - hover_position_).norm(),
+      odom_.v.norm(),
+      yes_no(hover_stable_started_),
+      active_planner_traj_id_,
+      completed_planner_traj_id_,
+      controller_.debug().normalized_thrust,
+      controller_.debug().total_acc.head<2>().norm(),
+      controller_.debug().pid_acc.head<2>().norm(),
+      controller_.debug().desired_velocity.head<2>().norm());
   }
 
   double yaw_from_quaternion(const Eigen::Quaterniond &q) const

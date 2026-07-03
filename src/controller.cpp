@@ -72,10 +72,14 @@ Eigen::Vector3d Controller::compute_pid_error_acc(const OdomState &odom, const D
 {
   Eigen::Vector3d acc_error;
   Eigen::Vector3d desired_velocity;
+  const double pos_error_limit = std::max(0.0, params_.pos_error_limit);
+  const double vel_error_limit = std::max(0.0, params_.vel_error_limit);
   for (int i = 0; i < 3; ++i) {
-    const double pos_error = std::isnan(des.p(i)) ? 0.0 : std::clamp(des.p(i) - odom.p(i), -1.0, 1.0);
+    const double pos_error = std::isnan(des.p(i)) ?
+      0.0 : std::clamp(des.p(i) - odom.p(i), -pos_error_limit, pos_error_limit);
     desired_velocity(i) = des.v(i) + params_.kp(i) * pos_error;
-    const double vel_error = std::clamp(desired_velocity(i) - odom.v(i), -1.0, 1.0);
+    const double vel_error =
+      std::clamp(desired_velocity(i) - odom.v(i), -vel_error_limit, vel_error_limit);
     acc_error(i) = params_.kv(i) * vel_error;
   }
   debug_.desired_velocity = desired_velocity;

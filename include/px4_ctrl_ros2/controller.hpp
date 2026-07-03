@@ -30,6 +30,8 @@ struct ControlParams
   Eigen::Vector3d kp{2.0, 2.0, 1.8};
   Eigen::Vector3d kv{2.0, 2.0, 2.0};
   Eigen::Vector3d kang{12.0, 12.0, 4.0};
+  double pos_error_limit{1.5};
+  double vel_error_limit{1.5};
 };
 
 struct OdomState

@@ -52,6 +52,11 @@ def generate_launch_description():
             description="PX4 vehicle odometry output topic.",
         ),
         DeclareLaunchArgument(
+            "nav_odom_topic",
+            default_value="/fastlio/odom",
+            description="nav_msgs/Odometry topic used when odom_source:=nav.",
+        ),
+        DeclareLaunchArgument(
             "vehicle_status_topic",
             default_value="/fmu/out/vehicle_status_v1",
             description="PX4 vehicle status output topic used by newer PX4 message versions.",
@@ -92,6 +97,11 @@ def generate_launch_description():
             description="EGO PRESET_TARGET start trigger topic.",
         ),
         DeclareLaunchArgument(
+            "planner_odom_topic",
+            default_value="/drone_0_visual_slam/odom",
+            description="ENU odometry topic consumed by EGO Planner in px4ctrl mode.",
+        ),
+        DeclareLaunchArgument(
             "takeoff_land_topic",
             default_value="/px4ctrl/takeoff_land_cmd",
             description="UInt8 takeoff/land command topic: 1=takeoff, 2=land.",
@@ -117,6 +127,7 @@ def generate_launch_description():
                 ("px4/in/vehicle_attitude_setpoint", LaunchConfiguration("vehicle_attitude_setpoint_topic")),
                 ("px4/in/vehicle_rates_setpoint", LaunchConfiguration("vehicle_rates_setpoint_topic")),
                 ("px4/out/vehicle_odometry", LaunchConfiguration("vehicle_odometry_topic")),
+                ("nav/odom", LaunchConfiguration("nav_odom_topic")),
                 ("px4/out/vehicle_status_v1", LaunchConfiguration("vehicle_status_topic")),
                 ("px4/out/vehicle_status", LaunchConfiguration("vehicle_status_fallback_topic")),
                 ("px4/out/manual_control_setpoint", LaunchConfiguration("manual_control_topic")),
@@ -125,6 +136,7 @@ def generate_launch_description():
                 ("px4/out/vehicle_land_detected", LaunchConfiguration("vehicle_land_detected_topic")),
                 ("ego/position_cmd", LaunchConfiguration("planner_pos_cmd_topic")),
                 ("ego/traj_start_trigger", LaunchConfiguration("planner_trigger_topic")),
+                ("ego/odom_world", LaunchConfiguration("planner_odom_topic")),
                 ("px4ctrl/takeoff_land_cmd", LaunchConfiguration("takeoff_land_topic")),
                 ("px4ctrl/debug_odom_enu", LaunchConfiguration("debug_odom_topic")),
             ],

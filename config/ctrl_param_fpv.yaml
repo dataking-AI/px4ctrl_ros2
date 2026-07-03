@@ -1,6 +1,8 @@
 px4_ctrl_node:
   ros__parameters:
-    mass: 0.5
+    # Gazebo x500_base + four rotors + x500_lidar_3d lidar is about 2.33 kg.
+    # Recalibrate this and hover_percentage before using the accurate thrust model on real hardware.
+    mass: 2.33
     gra: 9.81
     pose_solver: 1
     ctrl_freq_max: 100.0
@@ -8,7 +10,7 @@ px4_ctrl_node:
     max_manual_vel: 1.0
     max_angle: 30.0
     low_voltage: 14.0
-    hover_percentage: 0.40
+    hover_percentage: 0.78
     accurate_thrust_model: false
     thrust_model_print_value: false
     thrust_model_k1: 0.7583
@@ -21,6 +23,8 @@ px4_ctrl_node:
     kp: [2.0, 2.0, 1.8]
     kv: [2.0, 2.0, 2.0]
     kang: [12.0, 12.0, 4.0]
+    pos_error_limit: 1.5
+    vel_error_limit: 1.5
     msg_timeout_odom: 0.5
     msg_timeout_rc: 0.5
     msg_timeout_cmd: 0.5
@@ -32,6 +36,12 @@ px4_ctrl_node:
     enable_offboard_command: false
     enable_auto_arm: false
     enable_auto_takeoff_land: false
+    odom_source: "px4"
+    estimate_nav_odom_velocity: false
+    publish_planner_odom: true
+    hover_stable_pos_tol: 0.30
+    hover_stable_vel_tol: 0.30
+    hover_stable_time: 1.0
     takeoff_height: 1.0
     takeoff_land_speed: 0.14
     publish_debug_odom: true
