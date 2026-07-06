@@ -137,6 +137,14 @@ struct RcState
     last_gear = gear;
     last_reboot_cmd = reboot_cmd;
   }
+
+  bool check_centered() const
+  {
+    return std::abs(ch[0]) < 1.0e-5 &&
+      std::abs(ch[1]) < 1.0e-5 &&
+      std::abs(ch[2]) < 1.0e-5 &&
+      std::abs(ch[3]) < 1.0e-5;
+  }
 };
 
 class Px4CtrlNode : public rclcpp::Node
@@ -459,6 +467,36 @@ private:
   {
     reset_offboard_requests();
     if (takeoff_land_command_ == kTakeoffCommand && enable_auto_takeoff_land_) {
+      if (planner_cmd_received()) {
+        RCLCPP_ERROR(
+          get_logger(),
+          "[px4_ctrl_ros2] Reject AUTO_TAKEOFF. You are sending commands before toggling into AUTO_TAKEOFF, which is not allowed. Stop sending commands now!");
+        takeoff_land_command_ = 0;
+        return;
+      }
+      if (odom_.v.norm() > 0.1) {
+        RCLCPP_ERROR(
+          get_logger(),
+          "[px4_ctrl_ros2] Reject AUTO_TAKEOFF. Odom_Vel=%fm/s, non-static takeoff is not allowed!",
+          odom_.v.norm());
+        takeoff_land_command_ = 0;
+        return;
+      }
+      if (have_land_detected_ && !land_detected_.landed) {
+        RCLCPP_ERROR(
+          get_logger(),
+          "[px4_ctrl_ros2] Reject AUTO_TAKEOFF. land detector says that the drone is not landed now!");
+        takeoff_land_command_ = 0;
+        return;
+      }
+      if (rc_control_available() && (!rc_.is_hover_mode || !rc_.is_command_mode || !rc_.check_centered())) {
+        RCLCPP_ERROR(
+          get_logger(),
+          "[px4_ctrl_ros2] Reject AUTO_TAKEOFF. If you have your RC connected, keep its switches at auto hover and command control states, and all sticks at the center, then takeoff again.");
+        takeoff_land_command_ = 0;
+        return;
+      }
+
       set_hover_from_current(takeoff_height_);
       takeoff_land_command_ = 0;
       transition_to(FlightState::AUTO_TAKEOFF, "takeoff command accepted");
@@ -466,6 +504,20 @@ private:
     }
 
     if (rc_control_available() && rc_.enter_hover_mode) {
+      if (planner_cmd_received()) {
+        RCLCPP_ERROR(
+          get_logger(),
+          "[px4_ctrl_ros2] Reject AUTO_HOVER. You are sending commands before toggling into AUTO_HOVER, which is not allowed. Stop sending commands now!");
+        return;
+      }
+      if (odom_.v.norm() > 3.0) {
+        RCLCPP_ERROR(
+          get_logger(),
+          "[px4_ctrl_ros2] Reject AUTO_HOVER. Odom_Vel=%fm/s, which seems that the localization module goes wrong!",
+          odom_.v.norm());
+        return;
+      }
+
       set_hover_from_current(0.0);
       transition_to(FlightState::AUTO_HOVER, "RC hover switch entered");
     }
@@ -496,7 +548,7 @@ private:
       trigger_planner_once();
     }
 
-    if (command_authorized && planner_cmd_ready()) {
+    if (command_authorized && vehicle_is_offboard() && planner_cmd_ready()) {
       active_planner_traj_id_ = planner_cmd_.trajectory_id;
       transition_to(FlightState::CMD_CTRL, "fresh PositionCommand with RC command authorization");
       return;
@@ -505,6 +557,14 @@ private:
 
   void handle_cmd_ctrl_state(double dt)
   {
+    if (takeoff_land_command_ == kLandCommand && enable_auto_takeoff_land_) {
+      RCLCPP_ERROR(
+        get_logger(),
+        "[px4_ctrl_ros2] Reject AUTO_LAND, which must be triggered in AUTO_HOVER. Stop sending control commands for longer than %.3fs to let px4ctrl return to AUTO_HOVER first.",
+        msg_timeout_cmd_);
+      takeoff_land_command_ = 0;
+    }
+
     if (!rc_control_allowed()) {
       transition_to(FlightState::MANUAL_CTRL, "RC hover switch released or RC timeout");
       return;
@@ -786,11 +846,15 @@ private:
 
   bool planner_cmd_ready()
   {
-    return have_cmd_ &&
-      (now() - last_cmd_time_).seconds() < msg_timeout_cmd_ &&
+    return planner_cmd_received() &&
       position_cmd_is_trackable(planner_cmd_) &&
       planner_cmd_.trajectory_id > 0 &&
       planner_cmd_.trajectory_id != completed_planner_traj_id_;
+  }
+
+  bool planner_cmd_received()
+  {
+    return have_cmd_ && (now() - last_cmd_time_).seconds() < msg_timeout_cmd_;
   }
 
   bool planner_cmd_completed()
