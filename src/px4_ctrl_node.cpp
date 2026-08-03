@@ -1,4 +1,5 @@
 #include "px4_ctrl_ros2/controller.hpp"
+#include "vehicle_command_authorization.hpp"
 
 #include <px4_msgs/msg/battery_status.hpp>
 #include <px4_msgs/msg/input_rc.hpp>
@@ -190,6 +191,7 @@ private:
     CMD_CTRL,
     AUTO_TAKEOFF,
     AUTO_LAND,
+    EXITING_OFFBOARD,
     FAILSAFE
   };
 
@@ -198,6 +200,7 @@ private:
   RcState rc_{};
   OdomState odom_{};
   DesiredState planner_des_{};
+  DesiredState exit_hold_des_{};
   PositionCommand planner_cmd_{};
   VehicleStatus vehicle_status_{};
   VehicleLandDetected land_detected_{};
@@ -230,6 +233,9 @@ private:
   rclcpp::Time last_land_detected_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_cmd_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_control_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time planner_trigger_not_before_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time offboard_exit_start_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_offboard_exit_request_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_offboard_request_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_arm_request_time_{0, 0, RCL_ROS_TIME};
 
@@ -239,9 +245,9 @@ private:
   bool have_battery_{false};
   bool have_land_detected_{false};
   bool have_cmd_{false};
+  bool have_nav_state_before_offboard_{false};
   bool planner_trigger_sent_for_command_{false};
   bool offboard_requested_{false};
-  bool arm_requested_{false};
   bool hover_stable_started_{false};
   bool rc_required_{true};
   bool enable_offboard_command_{false};
@@ -266,16 +272,22 @@ private:
   double takeoff_height_{1.0};
   double takeoff_land_speed_{0.14};
   double battery_voltage_{14.0};
+  double offboard_exit_timeout_{1.0};
+  double offboard_exit_retry_interval_{0.2};
   uint64_t offboard_setpoint_counter_{0};
   uint32_t active_planner_traj_id_{0};
   uint32_t completed_planner_traj_id_{0};
   uint8_t takeoff_land_command_{0};
+  uint8_t nav_state_before_offboard_{VehicleStatus::NAVIGATION_STATE_POSCTL};
   Eigen::Vector3d hover_position_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d last_nav_odom_position_{Eigen::Vector3d::Zero()};
   double hover_yaw_{0.0};
+  double takeoff_spoolup_time_{3.0};
+  double takeoff_trigger_delay_{2.0};
   std::string odom_source_{"px4"};
   std::string odom_frame_id_{"world"};
   std::string odom_child_frame_id_{"base_link"};
+  rclcpp::Time takeoff_spool_start_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_nav_odom_stamp_{0, 0, RCL_ROS_TIME};
   rclcpp::Time hover_stable_start_time_{0, 0, RCL_ROS_TIME};
 
@@ -344,6 +356,10 @@ private:
     hover_stable_time_ = declare_parameter<double>("hover_stable_time", hover_stable_time_);
     takeoff_height_ = declare_parameter<double>("takeoff_height", takeoff_height_);
     takeoff_land_speed_ = declare_parameter<double>("takeoff_land_speed", takeoff_land_speed_);
+    takeoff_spoolup_time_ = std::max(
+      0.0, declare_parameter<double>("takeoff_spoolup_time", takeoff_spoolup_time_));
+    takeoff_trigger_delay_ = std::max(
+      0.0, declare_parameter<double>("takeoff_trigger_delay", takeoff_trigger_delay_));
     publish_debug_odom_ = declare_parameter<bool>("publish_debug_odom", publish_debug_odom_);
     verbose_ = declare_parameter<bool>("verbose", verbose_);
     battery_voltage_ = params_.low_voltage;
@@ -452,10 +468,13 @@ private:
         handle_cmd_ctrl_state(dt);
         break;
       case FlightState::AUTO_TAKEOFF:
-        handle_auto_takeoff_state(dt);
+        handle_auto_takeoff_state();
         break;
       case FlightState::AUTO_LAND:
         handle_auto_land_state(dt);
+        break;
+      case FlightState::EXITING_OFFBOARD:
+        handle_exiting_offboard_state();
         break;
       case FlightState::FAILSAFE:
         handle_failsafe_state();
@@ -489,7 +508,8 @@ private:
         takeoff_land_command_ = 0;
         return;
       }
-      if (rc_control_available() && (!rc_.is_hover_mode || !rc_.is_command_mode || !rc_.check_centered())) {
+      if (rc_required_ && rc_control_available() &&
+        (!rc_.is_hover_mode || !rc_.is_command_mode || !rc_.check_centered())) {
         RCLCPP_ERROR(
           get_logger(),
           "[px4_ctrl_ros2] Reject AUTO_TAKEOFF. If you have your RC connected, keep its switches at auto hover and command control states, and all sticks at the center, then takeoff again.");
@@ -497,7 +517,15 @@ private:
         return;
       }
 
-      set_hover_from_current(takeoff_height_);
+      hover_position_ = odom_.p;
+      hover_yaw_ = yaw_from_quaternion(odom_.q);
+      takeoff_spool_start_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+      planner_trigger_not_before_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+
+      planner_trigger_sent_for_command_ = false;
+      hover_stable_started_ = false;
+      controller_.reset_thrust_mapping();
+
       takeoff_land_command_ = 0;
       transition_to(FlightState::AUTO_TAKEOFF, "takeoff command accepted");
       return;
@@ -526,7 +554,7 @@ private:
   void handle_auto_hover_state(double dt)
   {
     if (!rc_control_allowed()) {
-      transition_to(FlightState::MANUAL_CTRL, "RC hover switch released or RC timeout");
+      begin_normal_offboard_exit("RC hover switch released or RC timeout");
       return;
     }
 
@@ -539,12 +567,16 @@ private:
     update_hover_from_rc(dt);
     publish_control(make_hover_desired());
 
+    const bool trigger_delay_elapsed =
+      planner_trigger_not_before_.nanoseconds() == 0 || now() >= planner_trigger_not_before_;
     const bool command_authorized = !rc_required_ || rc_.is_command_mode;
     const bool should_trigger_planner =
       (rc_required_ && rc_.is_command_mode) ||
       (!rc_required_ && auto_start_planner_);
     const bool hover_stable = hover_is_stable();
-    if (command_authorized && should_trigger_planner && hover_stable && !planner_trigger_sent_for_command_) {
+    if (command_authorized && should_trigger_planner && hover_stable && trigger_delay_elapsed &&
+      !planner_trigger_sent_for_command_)
+    {
       trigger_planner_once();
     }
 
@@ -566,9 +598,10 @@ private:
     }
 
     if (!rc_control_allowed()) {
-      transition_to(FlightState::MANUAL_CTRL, "RC hover switch released or RC timeout");
+      begin_normal_offboard_exit("RC hover switch released or RC timeout");
       return;
     }
+
     if (rc_required_ && !rc_.is_command_mode) {
       transition_to(FlightState::AUTO_HOVER, "RC command switch released");
       return;
@@ -589,18 +622,42 @@ private:
     publish_control(planner_des_);
   }
 
-  void handle_auto_takeoff_state(double dt)
+  void handle_auto_takeoff_state()
   {
-    if (rc_required_ && !rc_control_available()) {
-      transition_to(FlightState::MANUAL_CTRL, "RC timeout during takeoff");
+    if (rc_required_ && (!rc_control_available() || !rc_.is_hover_mode)) {
+      begin_normal_offboard_exit("operator aborted takeoff");
       return;
     }
 
-    hover_position_.z() = std::max(hover_position_.z(), odom_.p.z() + takeoff_land_speed_ * dt);
-    publish_control(make_hover_desired());
-    if (odom_.p.z() >= hover_position_.z() - 0.15) {
-      transition_to(FlightState::AUTO_HOVER, "takeoff height reached");
+    if (takeoff_spool_start_time_.nanoseconds() == 0) {
+      publish_control(make_takeoff_spool_desired(0.0));
+      if (vehicle_is_offboard() && vehicle_is_armed()) {
+        takeoff_spool_start_time_ = now();
+      }
+      return;
     }
+
+    if (!vehicle_is_offboard() || !vehicle_is_armed()) {
+      transition_to(FlightState::FAILSAFE, "Offboard or armed state lost during takeoff");
+      return;
+    }
+
+    const double elapsed = (now() - takeoff_spool_start_time_).seconds();
+
+    if (elapsed < takeoff_spoolup_time_) {
+      publish_control(make_takeoff_spool_desired(elapsed));
+      return;
+    }
+
+    if (odom_.p.z() >= hover_position_.z() + takeoff_height_) {
+      set_hover_from_current(0.0);
+      planner_trigger_not_before_ =
+        now() + rclcpp::Duration::from_seconds(takeoff_trigger_delay_);
+      transition_to(FlightState::AUTO_HOVER, "takeoff height reached");
+      return;
+    }
+
+    publish_control(make_takeoff_desired(elapsed));
   }
 
   void handle_auto_land_state(double dt)
@@ -614,10 +671,30 @@ private:
     publish_control(make_hover_desired());
 
     if (have_land_detected_ && land_detected_.landed) {
-      if (enable_offboard_command_ && enable_auto_arm_ && vehicle_is_armed()) {
-        publish_vehicle_command(VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0f);
+      if (vehicle_is_armed()) {
+        if (!enable_auto_arm_) {
+          RCLCPP_WARN_THROTTLE(
+            get_logger(),
+            *get_clock(),
+            5000,
+            "[px4_ctrl_ros2] landed but still armed; waiting for manual disarm");
+          return;
+        }
+
+        const auto current_time = now();
+        if (last_arm_request_time_.nanoseconds() == 0 ||
+          (current_time - last_arm_request_time_).seconds() > 1.0)
+        {
+          if (publish_vehicle_command(
+              VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0f))
+          {
+            last_arm_request_time_ = current_time;
+            RCLCPP_INFO(get_logger(), "[px4_ctrl_ros2] DISARM command sent");
+          }
+        }
+        return;
       }
-      transition_to(FlightState::MANUAL_CTRL, "land detected");
+      begin_normal_offboard_exit("landed and disarmed");
     }
   }
 
@@ -638,6 +715,25 @@ private:
     des.j.setZero();
     des.yaw = hover_yaw_;
     des.yaw_rate = 0.0;
+    return des;
+  }
+
+  DesiredState make_takeoff_spool_desired(double elapsed) const
+  {
+    DesiredState des = make_hover_desired();
+    const double t = std::clamp(elapsed, 0.0, takeoff_spoolup_time_);
+    des.a.z() = std::min(
+      std::exp((t - takeoff_spoolup_time_) * 6.0) * 7.0 - 7.0,
+      0.0);
+    return des;
+  }
+
+  DesiredState make_takeoff_desired(double elapsed) const
+  {
+    DesiredState des = make_hover_desired();
+    const double ascend_time = std::max(0.0, elapsed - takeoff_spoolup_time_);
+    des.p.z() += takeoff_land_speed_ * ascend_time;
+    des.v.z() = takeoff_land_speed_;
     return des;
   }
 
@@ -715,27 +811,63 @@ private:
     }
 
     const auto current_time = now();
+    const bool arm_request_interval_elapsed =
+      last_arm_request_time_.nanoseconds() == 0 ||
+      (current_time - last_arm_request_time_).seconds() > 1.0;
     if (!vehicle_is_offboard() &&
       (last_offboard_request_time_.nanoseconds() == 0 ||
       (current_time - last_offboard_request_time_).seconds() > 1.0)) {
-      publish_vehicle_command(VehicleCommand::VEHICLE_CMD_DO_SET_MODE, 1.0f, 6.0f);
-      offboard_requested_ = true;
-      last_offboard_request_time_ = current_time;
-      RCLCPP_INFO(get_logger(), "[px4_ctrl_ros2] OFFBOARD mode command sent");
+      if (!offboard_requested_ && status_ready()) {
+        nav_state_before_offboard_ = vehicle_status_.nav_state;
+        have_nav_state_before_offboard_ = true;
+      }
+      const bool first_request = !offboard_requested_;
+      if (publish_vehicle_command(VehicleCommand::VEHICLE_CMD_DO_SET_MODE, 1.0f, 6.0f)) {
+        offboard_requested_ = true;
+        last_offboard_request_time_ = current_time;
+        if (first_request) {
+          RCLCPP_INFO(get_logger(), "[px4_ctrl_ros2] OFFBOARD mode command sent");
+        } else {
+          RCLCPP_DEBUG(get_logger(), "[px4_ctrl_ros2] OFFBOARD mode command retried");
+        }
+      }
     }
 
-    if (enable_auto_arm_ && !vehicle_is_armed() &&
-      (last_arm_request_time_.nanoseconds() == 0 ||
-      (current_time - last_arm_request_time_).seconds() > 1.0)) {
-      publish_vehicle_command(VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0f);
-      arm_requested_ = true;
-      last_arm_request_time_ = current_time;
-      RCLCPP_INFO(get_logger(), "[px4_ctrl_ros2] ARM command sent");
+    if (enable_auto_arm_ &&
+      state_ == FlightState::AUTO_TAKEOFF &&
+      vehicle_is_offboard() &&
+      !vehicle_is_armed() &&
+      arm_request_interval_elapsed) {
+      const bool first_request = last_arm_request_time_.nanoseconds() == 0;
+      if (publish_vehicle_command(
+          VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0f))
+      {
+        last_arm_request_time_ = current_time;
+        if (first_request) {
+          RCLCPP_INFO(get_logger(), "[px4_ctrl_ros2] ARM command sent");
+        } else {
+          RCLCPP_DEBUG(get_logger(), "[px4_ctrl_ros2] ARM command retried");
+        }
+      }
     }
   }
 
-  void publish_vehicle_command(uint32_t command, float param1 = 0.0f, float param2 = 0.0f)
+  bool publish_vehicle_command(uint32_t command, float param1 = 0.0f, float param2 = 0.0f)
   {
+    const auto authority = command == VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM ?
+      VehicleCommandAuthority::ARM_DISARM : VehicleCommandAuthority::OFFBOARD;
+    if (!vehicle_command_allowed(
+        authority, enable_offboard_command_, enable_auto_arm_))
+    {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(),
+        *get_clock(),
+        2000,
+        "[px4_ctrl_ros2] vehicle command %u blocked by safety configuration",
+        command);
+      return false;
+    }
+
     VehicleCommand msg{};
     msg.param1 = param1;
     msg.param2 = param2;
@@ -747,6 +879,7 @@ private:
     msg.from_external = true;
     msg.timestamp = timestamp_us();
     vehicle_command_pub_->publish(msg);
+    return true;
   }
 
   void trigger_planner_once()
@@ -772,6 +905,7 @@ private:
     hover_position_.z() += z_offset;
     hover_yaw_ = yaw_from_quaternion(odom_.q);
     planner_trigger_sent_for_command_ = false;
+    planner_trigger_not_before_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
     hover_stable_started_ = false;
     active_planner_traj_id_ = 0;
     controller_.reset_thrust_mapping();
@@ -807,11 +941,80 @@ private:
   {
     offboard_setpoint_counter_ = 0;
     offboard_requested_ = false;
-    arm_requested_ = false;
     last_offboard_request_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
     last_arm_request_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
     planner_trigger_sent_for_command_ = false;
     hover_stable_started_ = false;
+  }
+
+  bool nav_state_to_px4_main_mode(uint8_t nav_state, float &main_mode) const
+  {
+    switch (nav_state) {
+      case VehicleStatus::NAVIGATION_STATE_MANUAL: main_mode = 1.0f; return true;
+      case VehicleStatus::NAVIGATION_STATE_ALTCTL: main_mode = 2.0f; return true;
+      case VehicleStatus::NAVIGATION_STATE_POSCTL: main_mode = 3.0f; return true;
+      case VehicleStatus::NAVIGATION_STATE_ACRO:   main_mode = 5.0f; return true;
+      case VehicleStatus::NAVIGATION_STATE_STAB:   main_mode = 7.0f; return true;
+      default: return false;
+    }
+  }
+
+  void begin_normal_offboard_exit(const char *reason)
+  {
+    if (!enable_offboard_command_) {
+      transition_to(FlightState::MANUAL_CTRL, "Offboard command output disabled");
+      return;
+    }
+
+    exit_hold_des_.p = odom_.p;
+    exit_hold_des_.v.setZero();
+    exit_hold_des_.a.setZero();
+    exit_hold_des_.j.setZero();
+    exit_hold_des_.yaw = yaw_from_quaternion(odom_.q);
+    exit_hold_des_.yaw_rate = 0.0;
+
+    offboard_exit_start_time_ = now();
+    last_offboard_exit_request_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+    transition_to(FlightState::EXITING_OFFBOARD, reason);
+  }
+
+  void handle_exiting_offboard_state()
+  {
+    if (!status_ready()) {
+      transition_to(FlightState::FAILSAFE, "PX4 status lost during Offboard exit");
+      return;
+    }
+
+    if (vehicle_status_.nav_state != VehicleStatus::NAVIGATION_STATE_OFFBOARD) {
+      have_nav_state_before_offboard_ = false;
+      transition_to(FlightState::MANUAL_CTRL, "PX4 confirmed Offboard exit");
+      return;
+    }
+
+    publish_control(exit_hold_des_);
+
+    const auto current_time = now();
+    if (last_offboard_exit_request_time_.nanoseconds() == 0 ||
+      (current_time - last_offboard_exit_request_time_).seconds() >=
+      offboard_exit_retry_interval_)
+    {
+      float main_mode = 0.0f;
+      if (!have_nav_state_before_offboard_ ||
+        !nav_state_to_px4_main_mode(nav_state_before_offboard_, main_mode))
+      {
+        main_mode = 3.0f;
+      }
+
+      if (publish_vehicle_command(
+          VehicleCommand::VEHICLE_CMD_DO_SET_MODE, 1.0f, main_mode))
+      {
+        last_offboard_exit_request_time_ = current_time;
+      }
+    }
+
+    if ((current_time - offboard_exit_start_time_).seconds() > offboard_exit_timeout_) {
+      transition_to(FlightState::FAILSAFE, "Offboard exit confirmation timeout");
+    }
   }
 
   bool odom_ready()
@@ -1155,35 +1358,43 @@ private:
   void log_diagnostics()
   {
     const auto throttle_ms = verbose_ ? 1000 : 5000;
+    const bool battery_ready =
+      have_battery_ && (now() - last_battery_time_).seconds() < msg_timeout_bat_;
     RCLCPP_INFO_THROTTLE(
       get_logger(),
       *get_clock(),
       throttle_ms,
-      "[px4_ctrl_ros2] state=%s output=%s odom_source=%s | px4(nav=%u arm=%u offboard=%s armed=%s) | odom=%s status=%s rc=%s cmd=%s bat=%s | rc(mode=%.2f gear=%.2f hover=%s cmd=%s) | pos=%.2f %.2f %.2f hover=%.2f %.2f %.2f err=%.2f vel=%.2f stable=%s traj=%u/%u | ctrl(thr=%.2f acc_xy=%.2f pid_xy=%.2f vdes_xy=%.2f)",
+      "[px4_ctrl_ros2] state=%s | px4=%s/%s | input: odom=%s status=%s rc=%s cmd=%s bat=%s | pos=(%.2f, %.2f, %.2f) err=%.2fm vel=%.2fm/s",
       state_name(state_),
-      yes_no(enable_offboard_command_),
-      odom_source_.c_str(),
-      have_status_ ? static_cast<unsigned>(vehicle_status_.nav_state) : 255U,
-      have_status_ ? static_cast<unsigned>(vehicle_status_.arming_state) : 255U,
-      yes_no(vehicle_is_offboard()),
-      yes_no(vehicle_is_armed()),
+      px4_mode_name(),
+      arming_state_name(),
       ok_wait(odom_ready()),
       ok_wait(status_ready()),
       ok_wait(rc_control_available()),
       ok_wait(planner_cmd_ready()),
-      ok_wait(have_battery_ && (now() - last_battery_time_).seconds() < msg_timeout_bat_),
+      ok_wait(battery_ready),
+      odom_.p.x(),
+      odom_.p.y(),
+      odom_.p.z(),
+      (odom_.p - hover_position_).norm(),
+      odom_.v.norm());
+
+    if (!verbose_) {
+      return;
+    }
+
+    RCLCPP_INFO_THROTTLE(
+      get_logger(),
+      *get_clock(),
+      1000,
+      "[px4_ctrl_ros2] detail: rc(mode=%.2f gear=%.2f hover=%s cmd=%s) | hover=(%.2f, %.2f, %.2f) stable=%s traj=%u/%u | ctrl(thr=%.2f acc_xy=%.2f pid_xy=%.2f vdes_xy=%.2f)",
       rc_.mode,
       rc_.gear,
       yes_no(rc_.is_hover_mode),
       yes_no(rc_.is_command_mode),
-      odom_.p.x(),
-      odom_.p.y(),
-      odom_.p.z(),
       hover_position_.x(),
       hover_position_.y(),
       hover_position_.z(),
-      (odom_.p - hover_position_).norm(),
-      odom_.v.norm(),
       yes_no(hover_stable_started_),
       active_planner_traj_id_,
       completed_planner_traj_id_,
@@ -1222,10 +1433,43 @@ private:
         return "AUTO_TAKEOFF";
       case FlightState::AUTO_LAND:
         return "AUTO_LAND";
+      case FlightState::EXITING_OFFBOARD:
+        return "EXITING_OFFBOARD";
       case FlightState::FAILSAFE:
         return "FAILSAFE";
     }
     return "UNKNOWN";
+  }
+
+  const char *px4_mode_name()
+  {
+    if (!status_ready()) {
+      return "WAIT";
+    }
+    switch (vehicle_status_.nav_state) {
+      case VehicleStatus::NAVIGATION_STATE_MANUAL:
+        return "MANUAL";
+      case VehicleStatus::NAVIGATION_STATE_ALTCTL:
+        return "ALTCTL";
+      case VehicleStatus::NAVIGATION_STATE_POSCTL:
+        return "POSCTL";
+      case VehicleStatus::NAVIGATION_STATE_ACRO:
+        return "ACRO";
+      case VehicleStatus::NAVIGATION_STATE_STAB:
+        return "STAB";
+      case VehicleStatus::NAVIGATION_STATE_OFFBOARD:
+        return "OFFBOARD";
+      default:
+        return "OTHER";
+    }
+  }
+
+  const char *arming_state_name()
+  {
+    if (!status_ready()) {
+      return "WAIT";
+    }
+    return vehicle_is_armed() ? "ARMED" : "NOT_ARMED";
   }
 
   const char *ok_wait(bool value) const
