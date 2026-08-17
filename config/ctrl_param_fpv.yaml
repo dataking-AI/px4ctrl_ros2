@@ -25,10 +25,11 @@ px4_ctrl_node:
     kang: [12.0, 12.0, 4.0]
     pos_error_limit: 1.5
     vel_error_limit: 1.5
-    msg_timeout_odom: 1.5
+    msg_timeout_odom: 0.5
     msg_timeout_rc: 0.5
     msg_timeout_cmd: 0.5
     msg_timeout_bat: 0.5
+    msg_timeout_imu: 0.5
     rc_reverse_roll: false
     rc_reverse_pitch: false
     rc_reverse_yaw: false

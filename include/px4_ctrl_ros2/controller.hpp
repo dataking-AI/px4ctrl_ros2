@@ -1,10 +1,14 @@
 #pragma once
 
 #include <Eigen/Dense>
+#include <rclcpp/rclcpp.hpp>
 
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <queue>
+#include <utility>
 
 namespace px4_ctrl_ros2
 {
@@ -59,6 +63,7 @@ struct ControllerOutput
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   Eigen::Quaterniond q{Eigen::Quaterniond::Identity()};
   Eigen::Vector3d bodyrates{Eigen::Vector3d::Zero()};
+  // Finite controller outputs are normalized to the PX4 command range [0, 1].
   double thrust{0.0};
 };
 
@@ -71,6 +76,7 @@ struct DebugValues
   Eigen::Vector3d feedback_bodyrates{Eigen::Vector3d::Zero()};
   double desired_acc_norm{0.0};
   double normalized_thrust{0.0};
+  double thr2acc{0.0};
 };
 
 class Controller
@@ -82,7 +88,13 @@ public:
   const ControlParams &params() const { return params_; }
   const DebugValues &debug() const { return debug_; }
 
-  ControllerOutput update_alg1(const DesiredState &des, const OdomState &odom, double voltage);
+  ControllerOutput update_alg1(
+    const DesiredState &des,
+    const OdomState &odom,
+    double voltage,
+    const rclcpp::Time &command_time);
+  bool estimate_thrust_model(double body_acc_z, const rclcpp::Time &sample_time);
+  double thr2acc() const { return thr2acc_; }
   void reset_thrust_mapping();
 
 private:
@@ -92,6 +104,12 @@ private:
   ControlParams params_{};
   DebugValues debug_{};
   double thr2acc_{9.81 / 0.40};
+  std::queue<std::pair<rclcpp::Time, double>> timed_thrust_;
+  static constexpr double kThrustModelRho2 = 0.998;
+  static constexpr double kThrustDelayMinSeconds = 0.035;
+  static constexpr double kThrustDelayMaxSeconds = 0.045;
+  static constexpr std::size_t kMaxTimedThrustSamples = 100;
+  double P_{1.0e6};
 
   Eigen::Vector3d compute_pid_error_acc(const OdomState &odom, const DesiredState &des);
   Eigen::Vector3d compute_limited_total_acc(

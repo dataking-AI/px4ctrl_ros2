@@ -61,6 +61,35 @@ if(BUILD_TESTING)
     src
   )
 
+  ament_add_gtest(test_thrust_mapping
+    test/test_thrust_mapping.cpp
+    src/controller.cpp
+  )
+  target_include_directories(test_thrust_mapping PRIVATE
+    include
+  )
+  ament_target_dependencies(test_thrust_mapping
+    rclcpp
+    Eigen3
+  )
+  target_link_libraries(test_thrust_mapping
+    Eigen3::Eigen
+  )
+
+  ament_add_gtest(test_thrust_estimation_support
+    test/test_thrust_estimation_support.cpp
+  )
+  target_include_directories(test_thrust_estimation_support PRIVATE
+    src
+  )
+  ament_target_dependencies(test_thrust_estimation_support
+    rclcpp
+    Eigen3
+  )
+  target_link_libraries(test_thrust_estimation_support
+    Eigen3::Eigen
+  )
+
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()

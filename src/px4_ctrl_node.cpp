@@ -1,10 +1,13 @@
 #include "px4_ctrl_ros2/controller.hpp"
+#include "flight_state.hpp"
+#include "thrust_estimation_input.hpp"
 #include "vehicle_command_authorization.hpp"
 
 #include <px4_msgs/msg/battery_status.hpp>
 #include <px4_msgs/msg/input_rc.hpp>
 #include <px4_msgs/msg/manual_control_setpoint.hpp>
 #include <px4_msgs/msg/offboard_control_mode.hpp>
+#include <px4_msgs/msg/sensor_combined.hpp>
 #include <px4_msgs/msg/vehicle_attitude_setpoint.hpp>
 #include <px4_msgs/msg/vehicle_command.hpp>
 #include <px4_msgs/msg/vehicle_land_detected.hpp>
@@ -184,16 +187,7 @@ private:
   using VehicleOdometry = px4_msgs::msg::VehicleOdometry;
   using VehicleRatesSetpoint = px4_msgs::msg::VehicleRatesSetpoint;
   using VehicleStatus = px4_msgs::msg::VehicleStatus;
-
-  enum class FlightState {
-    MANUAL_CTRL,
-    AUTO_HOVER,
-    CMD_CTRL,
-    AUTO_TAKEOFF,
-    AUTO_LAND,
-    EXITING_OFFBOARD,
-    FAILSAFE
-  };
+  using SensorCombined = px4_msgs::msg::SensorCombined;
 
   ControlParams params_{};
   Controller controller_;
@@ -204,6 +198,7 @@ private:
   PositionCommand planner_cmd_{};
   VehicleStatus vehicle_status_{};
   VehicleLandDetected land_detected_{};
+  Eigen::Vector3d imu_acc_flu_{Eigen::Vector3d::Zero()};
 
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::Publisher<OffboardControlMode>::SharedPtr offboard_control_mode_pub_;
@@ -221,6 +216,7 @@ private:
   rclcpp::Subscription<InputRc>::SharedPtr input_rc_sub_;
   rclcpp::Subscription<BatteryStatus>::SharedPtr battery_sub_;
   rclcpp::Subscription<VehicleLandDetected>::SharedPtr land_detected_sub_;
+  rclcpp::Subscription<SensorCombined>::SharedPtr sensor_combined_sub_;
   rclcpp::Subscription<PositionCommand>::SharedPtr planner_cmd_sub_;
   rclcpp::Subscription<UInt8>::SharedPtr takeoff_land_sub_;
 
@@ -231,6 +227,7 @@ private:
   rclcpp::Time last_rc_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_battery_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_land_detected_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_imu_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_cmd_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_control_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time planner_trigger_not_before_{0, 0, RCL_ROS_TIME};
@@ -244,6 +241,8 @@ private:
   bool have_rc_{false};
   bool have_battery_{false};
   bool have_land_detected_{false};
+  bool have_imu_{false};
+  bool imu_accelerometer_clipped_{false};
   bool have_cmd_{false};
   bool have_nav_state_before_offboard_{false};
   bool planner_trigger_sent_for_command_{false};
@@ -266,6 +265,7 @@ private:
   double msg_timeout_rc_{0.5};
   double msg_timeout_cmd_{0.5};
   double msg_timeout_bat_{0.5};
+  double msg_timeout_imu_{0.5};
   double hover_stable_pos_tol_{0.30};
   double hover_stable_vel_tol_{0.30};
   double hover_stable_time_{1.0};
@@ -330,6 +330,7 @@ private:
     msg_timeout_rc_ = declare_parameter<double>("msg_timeout_rc", msg_timeout_rc_);
     msg_timeout_cmd_ = declare_parameter<double>("msg_timeout_cmd", msg_timeout_cmd_);
     msg_timeout_bat_ = declare_parameter<double>("msg_timeout_bat", msg_timeout_bat_);
+    msg_timeout_imu_ = declare_parameter<double>("msg_timeout_imu", msg_timeout_imu_);
     reverse_roll_ = declare_parameter<bool>("rc_reverse_roll", reverse_roll_);
     reverse_pitch_ = declare_parameter<bool>("rc_reverse_pitch", reverse_pitch_);
     reverse_yaw_ = declare_parameter<bool>("rc_reverse_yaw", reverse_yaw_);
@@ -428,7 +429,11 @@ private:
     land_detected_sub_ = create_subscription<VehicleLandDetected>(
       "px4/out/vehicle_land_detected",
       px4_out_qos,
-      std::bind(&Px4CtrlNode::land_detected_callback, this, std::placeholders::_1));
+        std::bind(&Px4CtrlNode::land_detected_callback, this, std::placeholders::_1));
+    sensor_combined_sub_ = create_subscription<SensorCombined>(
+      "px4/out/sensor_combined",
+      px4_out_qos,
+      std::bind(&Px4CtrlNode::sensor_combined_callback, this, std::placeholders::_1));
     planner_cmd_sub_ = create_subscription<PositionCommand>(
       "ego/position_cmd",
       10,
@@ -524,8 +529,6 @@ private:
 
       planner_trigger_sent_for_command_ = false;
       hover_stable_started_ = false;
-      controller_.reset_thrust_mapping();
-
       takeoff_land_command_ = 0;
       transition_to(FlightState::AUTO_TAKEOFF, "takeoff command accepted");
       return;
@@ -743,8 +746,15 @@ private:
       return;
     }
 
+    const auto command_time = now();
+    if ((state_ == FlightState::AUTO_HOVER || state_ == FlightState::CMD_CTRL) &&
+      imu_sample_is_usable(command_time))
+    {
+      controller_.estimate_thrust_model(imu_acc_flu_.z(), command_time);
+    }
+
     publish_offboard_control_mode();
-    const auto output = controller_.update_alg1(des, odom_, battery_voltage_);
+    const auto output = controller_.update_alg1(des, odom_, battery_voltage_, command_time);
     if (!control_output_is_finite(output)) {
       RCLCPP_ERROR_THROTTLE(
         get_logger(),
@@ -753,12 +763,10 @@ private:
         "[px4_ctrl_ros2] controller output is non-finite; skip setpoint");
       return;
     }
-    const double thrust = std::clamp(output.thrust, 0.0, 1.0);
-
     if (params_.use_bodyrate_ctrl) {
-      publish_rates_setpoint(output, thrust);
+      publish_rates_setpoint(output);
     } else {
-      publish_attitude_setpoint(output, thrust, des.yaw_rate);
+      publish_attitude_setpoint(output, des.yaw_rate);
     }
 
     offboard_setpoint_counter_++;
@@ -779,12 +787,12 @@ private:
     offboard_control_mode_pub_->publish(msg);
   }
 
-  void publish_attitude_setpoint(const ControllerOutput &output, double thrust, double yaw_rate_enu)
+  void publish_attitude_setpoint(const ControllerOutput &output, double yaw_rate_enu)
   {
     const Eigen::Quaterniond q_ned_frd = enu_flu_to_ned_frd(output.q);
     VehicleAttitudeSetpoint msg{};
     msg.q_d = eigen_quat_to_px4_array(q_ned_frd);
-    msg.thrust_body = {0.0f, 0.0f, static_cast<float>(-thrust)};
+    msg.thrust_body = {0.0f, 0.0f, static_cast<float>(-output.thrust)};
     msg.yaw_sp_move_rate = static_cast<float>(-yaw_rate_enu);
     msg.reset_integral = false;
     msg.fw_control_yaw_wheel = false;
@@ -792,13 +800,13 @@ private:
     attitude_setpoint_pub_->publish(msg);
   }
 
-  void publish_rates_setpoint(const ControllerOutput &output, double thrust)
+  void publish_rates_setpoint(const ControllerOutput &output)
   {
     VehicleRatesSetpoint msg{};
     msg.roll = static_cast<float>(output.bodyrates.x());
     msg.pitch = static_cast<float>(-output.bodyrates.y());
     msg.yaw = static_cast<float>(-output.bodyrates.z());
-    msg.thrust_body = {0.0f, 0.0f, static_cast<float>(-thrust)};
+    msg.thrust_body = {0.0f, 0.0f, static_cast<float>(-output.thrust)};
     msg.reset_integral = false;
     msg.timestamp = timestamp_us();
     rates_setpoint_pub_->publish(msg);
@@ -908,7 +916,6 @@ private:
     planner_trigger_not_before_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
     hover_stable_started_ = false;
     active_planner_traj_id_ = 0;
-    controller_.reset_thrust_mapping();
   }
 
   void set_hover_from_desired(const DesiredState &des)
@@ -1088,6 +1095,17 @@ private:
     return status_ready() && vehicle_status_.arming_state == VehicleStatus::ARMING_STATE_ARMED;
   }
 
+  bool imu_sample_is_usable(const rclcpp::Time &sample_time) const
+  {
+    return thrust_estimation_imu_sample_is_usable(
+      have_imu_,
+      imu_accelerometer_clipped_,
+      imu_acc_flu_,
+      sample_time,
+      last_imu_time_,
+      msg_timeout_imu_);
+  }
+
   bool position_cmd_is_trackable(const PositionCommand &msg) const
   {
     return msg.trajectory_flag == PositionCommand::TRAJECTORY_STATUS_READY &&
@@ -1139,6 +1157,9 @@ private:
       return;
     }
     const auto old = state_;
+    if (should_reset_thrust_mapping(old, next)) {
+      controller_.reset_thrust_mapping();
+    }
     state_ = next;
     state_enter_time_ = now();
     if (next == FlightState::MANUAL_CTRL || next == FlightState::FAILSAFE) {
@@ -1298,6 +1319,19 @@ private:
     last_land_detected_time_ = now();
   }
 
+  void sensor_combined_callback(const SensorCombined::SharedPtr msg)
+  {
+    const auto acceleration_flu = sensor_acceleration_frd_to_flu(msg->accelerometer_m_s2);
+    if (!acceleration_flu.has_value()) {
+      return;
+    }
+
+    imu_acc_flu_ = *acceleration_flu;
+    imu_accelerometer_clipped_ = msg->accelerometer_clipping != 0;
+    have_imu_ = true;
+    last_imu_time_ = now();
+  }
+
   void planner_cmd_callback(const PositionCommand::SharedPtr msg)
   {
     planner_cmd_ = *msg;
@@ -1387,7 +1421,7 @@ private:
       get_logger(),
       *get_clock(),
       1000,
-      "[px4_ctrl_ros2] detail: rc(mode=%.2f gear=%.2f hover=%s cmd=%s) | hover=(%.2f, %.2f, %.2f) stable=%s traj=%u/%u | ctrl(thr=%.2f acc_xy=%.2f pid_xy=%.2f vdes_xy=%.2f)",
+      "[px4_ctrl_ros2] detail: rc(mode=%.2f gear=%.2f hover=%s cmd=%s) | hover=(%.2f, %.2f, %.2f) stable=%s traj=%u/%u | ctrl(thr=%.2f thr2acc=%.2f acc_xy=%.2f pid_xy=%.2f vdes_xy=%.2f)",
       rc_.mode,
       rc_.gear,
       yes_no(rc_.is_hover_mode),
@@ -1399,6 +1433,7 @@ private:
       active_planner_traj_id_,
       completed_planner_traj_id_,
       controller_.debug().normalized_thrust,
+      controller_.debug().thr2acc,
       controller_.debug().total_acc.head<2>().norm(),
       controller_.debug().pid_acc.head<2>().norm(),
       controller_.debug().desired_velocity.head<2>().norm());

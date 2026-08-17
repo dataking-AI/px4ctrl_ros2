@@ -1,0 +1,85 @@
+#include "flight_state.hpp"
+#include "thrust_estimation_input.hpp"
+
+#include <gtest/gtest.h>
+
+#include <limits>
+
+namespace px4_ctrl_ros2
+{
+
+TEST(ThrustMappingResetPolicy, ResetsOnlyWhenManualControlEntersAutomaticControl)
+{
+  EXPECT_TRUE(should_reset_thrust_mapping(FlightState::MANUAL_CTRL, FlightState::AUTO_HOVER));
+  EXPECT_TRUE(should_reset_thrust_mapping(FlightState::MANUAL_CTRL, FlightState::AUTO_TAKEOFF));
+
+  EXPECT_FALSE(should_reset_thrust_mapping(FlightState::AUTO_HOVER, FlightState::CMD_CTRL));
+  EXPECT_FALSE(should_reset_thrust_mapping(FlightState::CMD_CTRL, FlightState::AUTO_HOVER));
+  EXPECT_FALSE(should_reset_thrust_mapping(FlightState::AUTO_TAKEOFF, FlightState::AUTO_HOVER));
+  EXPECT_FALSE(should_reset_thrust_mapping(FlightState::AUTO_HOVER, FlightState::AUTO_LAND));
+  EXPECT_FALSE(should_reset_thrust_mapping(FlightState::MANUAL_CTRL, FlightState::FAILSAFE));
+}
+
+TEST(ThrustEstimationInput, ConvertsSensorAccelerationFromFrdToFlu)
+{
+  const auto acceleration_flu = sensor_acceleration_frd_to_flu({1.0f, 2.0f, -3.0f});
+
+  ASSERT_TRUE(acceleration_flu.has_value());
+  EXPECT_DOUBLE_EQ(1.0, acceleration_flu->x());
+  EXPECT_DOUBLE_EQ(-2.0, acceleration_flu->y());
+  EXPECT_DOUBLE_EQ(3.0, acceleration_flu->z());
+}
+
+TEST(ThrustEstimationInput, RejectsNonFiniteSensorAcceleration)
+{
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  const float infinity = std::numeric_limits<float>::infinity();
+
+  EXPECT_FALSE(sensor_acceleration_frd_to_flu({nan, 0.0f, -9.81f}).has_value());
+  EXPECT_FALSE(sensor_acceleration_frd_to_flu({0.0f, infinity, -9.81f}).has_value());
+}
+
+TEST(ThrustEstimationInput, AcceptsOnlyFreshUnclippedPositiveAcceleration)
+{
+  const rclcpp::Time received_time(1'000'000'000LL);
+  const auto fresh_time = received_time + rclcpp::Duration::from_seconds(0.1);
+  const Eigen::Vector3d acceleration_flu(0.0, 0.0, 9.81);
+
+  EXPECT_TRUE(
+    thrust_estimation_imu_sample_is_usable(
+      true, false, acceleration_flu, fresh_time, received_time, 0.5));
+  EXPECT_FALSE(
+    thrust_estimation_imu_sample_is_usable(
+      false, false, acceleration_flu, fresh_time, received_time, 0.5));
+  EXPECT_FALSE(
+    thrust_estimation_imu_sample_is_usable(
+      true, true, acceleration_flu, fresh_time, received_time, 0.5));
+  EXPECT_FALSE(
+    thrust_estimation_imu_sample_is_usable(
+      true, false, Eigen::Vector3d::Zero(), fresh_time, received_time, 0.5));
+}
+
+TEST(ThrustEstimationInput, RejectsExpiredAndFutureDatedSamples)
+{
+  const rclcpp::Time received_time(1'000'000'000LL);
+  const Eigen::Vector3d acceleration_flu(0.0, 0.0, 9.81);
+
+  EXPECT_FALSE(
+    thrust_estimation_imu_sample_is_usable(
+      true,
+      false,
+      acceleration_flu,
+      received_time + rclcpp::Duration::from_seconds(0.5),
+      received_time,
+      0.5));
+  EXPECT_FALSE(
+    thrust_estimation_imu_sample_is_usable(
+      true,
+      false,
+      acceleration_flu,
+      received_time - rclcpp::Duration::from_seconds(0.001),
+      received_time,
+      0.5));
+}
+
+}  // namespace px4_ctrl_ros2

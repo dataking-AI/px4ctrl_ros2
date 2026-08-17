@@ -45,17 +45,24 @@ void Controller::reset_thrust_mapping()
 {
   const double hover_percentage = std::clamp(params_.hover_percentage, 0.05, 0.95);
   thr2acc_ = params_.gra / hover_percentage;
+  P_ = 1.0e6;
+  timed_thrust_ = {};
+  debug_.thr2acc = thr2acc_;
 }
 
 ControllerOutput Controller::update_alg1(
   const DesiredState &des,
   const OdomState &odom,
-  double voltage)
+  double voltage,
+  const rclcpp::Time &command_time)
 {
   ControllerOutput output{};
   const Eigen::Vector3d pid_error_acc = compute_pid_error_acc(odom, des);
   const Eigen::Vector3d total_des_acc = compute_limited_total_acc(pid_error_acc, des.a);
-  output.thrust = compute_desired_collective_thrust(odom.q, odom.v, total_des_acc, voltage);
+  const double requested_thrust =
+    compute_desired_collective_thrust(odom.q, odom.v, total_des_acc, voltage);
+  output.thrust = std::isfinite(requested_thrust) ?
+    std::clamp(requested_thrust, 0.0, 1.0) : requested_thrust;
   output.q = compute_flat_attitude(total_des_acc, des.j, des.yaw, des.yaw_rate, odom.q, output.bodyrates);
   const Eigen::Vector3d feedback_bodyrates = compute_feedback_bodyrates(output.q, odom.q);
   output.bodyrates += feedback_bodyrates;
@@ -65,7 +72,60 @@ ControllerOutput Controller::update_alg1(
   debug_.desired_q = output.q;
   debug_.feedback_bodyrates = feedback_bodyrates;
   debug_.normalized_thrust = output.thrust;
+  debug_.thr2acc = thr2acc_;
+
+  if (std::isfinite(output.thrust) && output.thrust > 0.0) {
+    timed_thrust_.emplace(command_time, output.thrust);
+    while (timed_thrust_.size() > kMaxTimedThrustSamples) {
+      timed_thrust_.pop();
+    }
+  }
   return output;
+}
+
+bool Controller::estimate_thrust_model(double body_acc_z, const rclcpp::Time &sample_time)
+{
+  if (!std::isfinite(body_acc_z) || body_acc_z <= 0.0) {
+    return false;
+  }
+
+  while (!timed_thrust_.empty()) {
+    const auto &timed_thrust = timed_thrust_.front();
+    const double elapsed = (sample_time - timed_thrust.first).seconds();
+    if (elapsed > kThrustDelayMaxSeconds) {
+      timed_thrust_.pop();
+      continue;
+    }
+    if (elapsed < kThrustDelayMinSeconds) {
+      return false;
+    }
+
+    const double thrust = timed_thrust.second;
+    timed_thrust_.pop();
+    if (!std::isfinite(thrust) || thrust <= 0.0) {
+      return false;
+    }
+
+    const double denominator = kThrustModelRho2 + thrust * P_ * thrust;
+    if (!std::isfinite(denominator) || denominator <= 0.0) {
+      return false;
+    }
+
+    const double gain = P_ * thrust / denominator;
+    const double updated_thr2acc = thr2acc_ + gain * (body_acc_z - thrust * thr2acc_);
+    const double updated_covariance = (1.0 - gain * thrust) * P_ / kThrustModelRho2;
+    if (!std::isfinite(updated_thr2acc) || !std::isfinite(updated_covariance) ||
+      updated_covariance <= 0.0)
+    {
+      return false;
+    }
+
+    thr2acc_ = updated_thr2acc;
+    P_ = updated_covariance;
+    debug_.thr2acc = thr2acc_;
+    return true;
+  }
+  return false;
 }
 
 Eigen::Vector3d Controller::compute_pid_error_acc(const OdomState &odom, const DesiredState &des)

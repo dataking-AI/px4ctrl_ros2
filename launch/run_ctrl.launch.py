@@ -82,6 +82,11 @@ def generate_launch_description():
             description="PX4 battery status output topic.",
         ),
         DeclareLaunchArgument(
+            "sensor_combined_topic",
+            default_value="/fmu/out/sensor_combined",
+            description="PX4 SensorCombined output used for online thrust identification.",
+        ),
+        DeclareLaunchArgument(
             "vehicle_land_detected_topic",
             default_value="/fmu/out/vehicle_land_detected",
             description="PX4 land detector output topic.",
@@ -133,6 +138,10 @@ def generate_launch_description():
                 ("px4/out/manual_control_setpoint", LaunchConfiguration("manual_control_topic")),
                 ("px4/out/input_rc", LaunchConfiguration("input_rc_topic")),
                 ("px4/out/battery_status", LaunchConfiguration("battery_status_topic")),
+                (
+                    "px4/out/sensor_combined",
+                    LaunchConfiguration("sensor_combined_topic"),
+                ),
                 ("px4/out/vehicle_land_detected", LaunchConfiguration("vehicle_land_detected_topic")),
                 ("ego/position_cmd", LaunchConfiguration("planner_pos_cmd_topic")),
                 ("ego/traj_start_trigger", LaunchConfiguration("planner_trigger_topic")),
