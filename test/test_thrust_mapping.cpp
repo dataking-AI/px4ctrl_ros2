@@ -46,6 +46,34 @@ TEST(ThrustMapping, UpdatesWithACommandInsideTheDelayWindow)
 
   EXPECT_TRUE(controller.estimate_thrust_model(12.0, command_time + rclcpp::Duration::from_seconds(0.040)));
   EXPECT_NEAR(30.0, controller.thr2acc(), 1.0e-3);
+  EXPECT_NEAR(9.81 / 30.0, controller.debug().hover_percentage, 1.0e-5);
+  EXPECT_FALSE(controller.debug().thrust_estimate_clamped);
+}
+
+TEST(ThrustMapping, ClampsEstimatedHoverPercentageAtLowerBound)
+{
+  auto controller = make_controller();
+  const rclcpp::Time command_time(1'000'000'000LL);
+  enqueue_hover_thrust(controller, command_time);
+
+  EXPECT_TRUE(controller.estimate_thrust_model(
+      100.0, command_time + rclcpp::Duration::from_seconds(0.040)));
+  EXPECT_DOUBLE_EQ(0.1, controller.debug().hover_percentage);
+  EXPECT_DOUBLE_EQ(9.81 / 0.1, controller.thr2acc());
+  EXPECT_TRUE(controller.debug().thrust_estimate_clamped);
+}
+
+TEST(ThrustMapping, ClampsEstimatedHoverPercentageAtUpperBound)
+{
+  auto controller = make_controller();
+  const rclcpp::Time command_time(1'000'000'000LL);
+  enqueue_hover_thrust(controller, command_time);
+
+  EXPECT_TRUE(controller.estimate_thrust_model(
+      1.0, command_time + rclcpp::Duration::from_seconds(0.040)));
+  EXPECT_DOUBLE_EQ(0.8, controller.debug().hover_percentage);
+  EXPECT_DOUBLE_EQ(9.81 / 0.8, controller.thr2acc());
+  EXPECT_TRUE(controller.debug().thrust_estimate_clamped);
 }
 
 TEST(ThrustMapping, ConvergesToTheMeasuredThrustAccelerationRatio)
@@ -127,6 +155,8 @@ TEST(ThrustMapping, ResetClearsQueuedCommandsAndRestoresFastConvergence)
 
   EXPECT_FALSE(controller.estimate_thrust_model(12.0, command_time + rclcpp::Duration::from_seconds(0.040)));
   EXPECT_DOUBLE_EQ(initial_thr2acc, controller.thr2acc());
+  EXPECT_DOUBLE_EQ(0.4, controller.debug().hover_percentage);
+  EXPECT_FALSE(controller.debug().thrust_estimate_clamped);
 
   const auto next_command_time = command_time + rclcpp::Duration::from_seconds(0.100);
   enqueue_hover_thrust(controller, next_command_time);

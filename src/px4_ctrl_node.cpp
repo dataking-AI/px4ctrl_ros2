@@ -274,6 +274,8 @@ private:
   double battery_voltage_{14.0};
   double offboard_exit_timeout_{1.0};
   double offboard_exit_retry_interval_{0.2};
+  uint64_t imu_sample_id_{0};
+  uint64_t last_consumed_imu_sample_id_{0};
   uint64_t offboard_setpoint_counter_{0};
   uint32_t active_planner_traj_id_{0};
   uint32_t completed_planner_traj_id_{0};
@@ -750,7 +752,18 @@ private:
     if ((state_ == FlightState::AUTO_HOVER || state_ == FlightState::CMD_CTRL) &&
       imu_sample_is_usable(command_time))
     {
-      controller_.estimate_thrust_model(imu_acc_flu_.z(), command_time);
+      last_consumed_imu_sample_id_ = imu_sample_id_;
+      const bool thrust_model_updated =
+        controller_.estimate_thrust_model(imu_acc_flu_.z(), last_imu_time_);
+      if (thrust_model_updated && controller_.debug().thrust_estimate_clamped) {
+        RCLCPP_ERROR_THROTTLE(
+          get_logger(),
+          *get_clock(),
+          1000,
+          "[px4_ctrl_ros2] online thrust estimate exceeded safe hover range; clamped hover_percentage=%.3f thr2acc=%.3f",
+          controller_.debug().hover_percentage,
+          controller_.debug().thr2acc);
+      }
     }
 
     publish_offboard_control_mode();
@@ -1101,6 +1114,8 @@ private:
       have_imu_,
       imu_accelerometer_clipped_,
       imu_acc_flu_,
+      imu_sample_id_,
+      last_consumed_imu_sample_id_,
       sample_time,
       last_imu_time_,
       msg_timeout_imu_);
@@ -1321,12 +1336,16 @@ private:
 
   void sensor_combined_callback(const SensorCombined::SharedPtr msg)
   {
+    const auto acceleration_timestamp_us = sensor_acceleration_timestamp_us(
+      msg->timestamp,
+      msg->accelerometer_timestamp_relative);
     const auto acceleration_flu = sensor_acceleration_frd_to_flu(msg->accelerometer_m_s2);
-    if (!acceleration_flu.has_value()) {
+    if (!acceleration_timestamp_us.has_value() || !acceleration_flu.has_value()) {
       return;
     }
 
     imu_acc_flu_ = *acceleration_flu;
+    imu_sample_id_ = *acceleration_timestamp_us;
     imu_accelerometer_clipped_ = msg->accelerometer_clipping != 0;
     have_imu_ = true;
     last_imu_time_ = now();

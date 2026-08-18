@@ -77,6 +77,8 @@ struct DebugValues
   double desired_acc_norm{0.0};
   double normalized_thrust{0.0};
   double thr2acc{0.0};
+  double hover_percentage{0.0};
+  bool thrust_estimate_clamped{false};
 };
 
 class Controller
@@ -106,6 +108,8 @@ private:
   double thr2acc_{9.81 / 0.40};
   std::queue<std::pair<rclcpp::Time, double>> timed_thrust_;
   static constexpr double kThrustModelRho2 = 0.998;
+  static constexpr double kMinEstimatedHoverPercentage = 0.1;
+  static constexpr double kMaxEstimatedHoverPercentage = 0.8;
   static constexpr double kThrustDelayMinSeconds = 0.035;
   static constexpr double kThrustDelayMaxSeconds = 0.045;
   static constexpr std::size_t kMaxTimedThrustSamples = 100;

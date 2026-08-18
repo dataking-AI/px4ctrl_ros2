@@ -48,6 +48,8 @@ void Controller::reset_thrust_mapping()
   P_ = 1.0e6;
   timed_thrust_ = {};
   debug_.thr2acc = thr2acc_;
+  debug_.hover_percentage = hover_percentage;
+  debug_.thrust_estimate_clamped = false;
 }
 
 ControllerOutput Controller::update_alg1(
@@ -85,7 +87,10 @@ ControllerOutput Controller::update_alg1(
 
 bool Controller::estimate_thrust_model(double body_acc_z, const rclcpp::Time &sample_time)
 {
-  if (!std::isfinite(body_acc_z) || body_acc_z <= 0.0) {
+  debug_.thrust_estimate_clamped = false;
+  if (!std::isfinite(body_acc_z) || body_acc_z <= 0.0 ||
+    !std::isfinite(params_.gra) || params_.gra <= 0.0)
+  {
     return false;
   }
 
@@ -114,15 +119,26 @@ bool Controller::estimate_thrust_model(double body_acc_z, const rclcpp::Time &sa
     const double gain = P_ * thrust / denominator;
     const double updated_thr2acc = thr2acc_ + gain * (body_acc_z - thrust * thr2acc_);
     const double updated_covariance = (1.0 - gain * thrust) * P_ / kThrustModelRho2;
-    if (!std::isfinite(updated_thr2acc) || !std::isfinite(updated_covariance) ||
-      updated_covariance <= 0.0)
+    if (!std::isfinite(updated_thr2acc) || updated_thr2acc <= 0.0 ||
+      !std::isfinite(updated_covariance) || updated_covariance <= 0.0)
     {
       return false;
     }
 
-    thr2acc_ = updated_thr2acc;
+    const double estimated_hover_percentage = params_.gra / updated_thr2acc;
+    if (!std::isfinite(estimated_hover_percentage) || estimated_hover_percentage <= 0.0) {
+      return false;
+    }
+    const double bounded_hover_percentage = std::clamp(
+      estimated_hover_percentage,
+      kMinEstimatedHoverPercentage,
+      kMaxEstimatedHoverPercentage);
+
+    thr2acc_ = params_.gra / bounded_hover_percentage;
     P_ = updated_covariance;
     debug_.thr2acc = thr2acc_;
+    debug_.hover_percentage = bounded_hover_percentage;
+    debug_.thrust_estimate_clamped = bounded_hover_percentage != estimated_hover_percentage;
     return true;
   }
   return false;
