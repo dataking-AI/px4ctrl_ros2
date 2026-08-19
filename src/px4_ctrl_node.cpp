@@ -1,4 +1,5 @@
 #include "px4_ctrl_ros2/controller.hpp"
+#include "control_behavior.hpp"
 #include "flight_state.hpp"
 #include "thrust_estimation_input.hpp"
 #include "vehicle_command_authorization.hpp"
@@ -672,6 +673,20 @@ private:
       return;
     }
 
+    switch (auto_land_rc_action(
+        rc_required_, rc_control_available(), rc_.is_hover_mode, rc_.is_command_mode))
+    {
+      case AutoLandRcAction::EXIT_OFFBOARD:
+        begin_normal_offboard_exit("RC hover switch released or RC timeout during land");
+        return;
+      case AutoLandRcAction::HOLD_POSITION:
+        set_hover_from_current(0.0);
+        transition_to(FlightState::AUTO_HOVER, "RC command switch released during land");
+        return;
+      case AutoLandRcAction::CONTINUE_LANDING:
+        break;
+    }
+
     hover_position_.z() = std::max(0.0, hover_position_.z() - takeoff_land_speed_ * dt);
     publish_control(make_hover_desired());
 
@@ -755,6 +770,17 @@ private:
       last_consumed_imu_sample_id_ = imu_sample_id_;
       const bool thrust_model_updated =
         controller_.estimate_thrust_model(imu_acc_flu_.z(), last_imu_time_);
+      if (thrust_model_updated && !params_.accurate_thrust_model &&
+        params_.thrust_model_print_value)
+      {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(),
+          *get_clock(),
+          1000,
+          "[px4_ctrl_ros2] hover_percentage=%.3f thr2acc=%.3f",
+          controller_.debug().hover_percentage,
+          controller_.debug().thr2acc);
+      }
       if (thrust_model_updated && controller_.debug().thrust_estimate_clamped) {
         RCLCPP_ERROR_THROTTLE(
           get_logger(),
@@ -779,7 +805,7 @@ private:
     if (params_.use_bodyrate_ctrl) {
       publish_rates_setpoint(output);
     } else {
-      publish_attitude_setpoint(output, des.yaw_rate);
+      publish_attitude_setpoint(output);
     }
 
     offboard_setpoint_counter_++;
@@ -800,13 +826,13 @@ private:
     offboard_control_mode_pub_->publish(msg);
   }
 
-  void publish_attitude_setpoint(const ControllerOutput &output, double yaw_rate_enu)
+  void publish_attitude_setpoint(const ControllerOutput &output)
   {
     const Eigen::Quaterniond q_ned_frd = enu_flu_to_ned_frd(output.q);
     VehicleAttitudeSetpoint msg{};
     msg.q_d = eigen_quat_to_px4_array(q_ned_frd);
     msg.thrust_body = {0.0f, 0.0f, static_cast<float>(-output.thrust)};
-    msg.yaw_sp_move_rate = static_cast<float>(-yaw_rate_enu);
+    msg.yaw_sp_move_rate = attitude_yaw_sp_move_rate();
     msg.reset_integral = false;
     msg.fw_control_yaw_wheel = false;
     msg.timestamp = timestamp_us();

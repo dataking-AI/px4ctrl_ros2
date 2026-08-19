@@ -1,3 +1,4 @@
+#include "control_behavior.hpp"
 #include "flight_state.hpp"
 #include "thrust_estimation_input.hpp"
 
@@ -18,6 +19,42 @@ TEST(ThrustMappingResetPolicy, ResetsOnlyWhenManualControlEntersAutomaticControl
   EXPECT_FALSE(should_reset_thrust_mapping(FlightState::AUTO_TAKEOFF, FlightState::AUTO_HOVER));
   EXPECT_FALSE(should_reset_thrust_mapping(FlightState::AUTO_HOVER, FlightState::AUTO_LAND));
   EXPECT_FALSE(should_reset_thrust_mapping(FlightState::MANUAL_CTRL, FlightState::FAILSAFE));
+}
+
+TEST(AutoLandRcPolicy, ExitsOffboardWhenRequiredRcIsUnavailableOrLeavesHoverMode)
+{
+  EXPECT_EQ(
+    AutoLandRcAction::EXIT_OFFBOARD,
+    auto_land_rc_action(true, false, true, true));
+  EXPECT_EQ(
+    AutoLandRcAction::EXIT_OFFBOARD,
+    auto_land_rc_action(true, true, false, true));
+}
+
+TEST(AutoLandRcPolicy, HoldsPositionWhenCommandModeIsReleased)
+{
+  EXPECT_EQ(
+    AutoLandRcAction::HOLD_POSITION,
+    auto_land_rc_action(true, true, true, false));
+}
+
+TEST(AutoLandRcPolicy, ContinuesWithAuthorizedRc)
+{
+  EXPECT_EQ(
+    AutoLandRcAction::CONTINUE_LANDING,
+    auto_land_rc_action(true, true, true, true));
+}
+
+TEST(AutoLandRcPolicy, IgnoresRcStateWhenRcIsNotRequired)
+{
+  EXPECT_EQ(
+    AutoLandRcAction::CONTINUE_LANDING,
+    auto_land_rc_action(false, false, false, false));
+}
+
+TEST(AttitudeSetpointPolicy, IgnoresYawRateFeedforward)
+{
+  EXPECT_FLOAT_EQ(0.0F, attitude_yaw_sp_move_rate());
 }
 
 TEST(ThrustEstimationInput, ConvertsSensorAccelerationFromFrdToFlu)

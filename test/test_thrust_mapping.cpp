@@ -50,6 +50,29 @@ TEST(ThrustMapping, UpdatesWithACommandInsideTheDelayWindow)
   EXPECT_FALSE(controller.debug().thrust_estimate_clamped);
 }
 
+TEST(ThrustMapping, PrintOptionDoesNotChangeEstimation)
+{
+  ControlParams quiet_params{};
+  quiet_params.gra = 9.81;
+  quiet_params.hover_percentage = 0.4;
+  ControlParams print_params = quiet_params;
+  print_params.thrust_model_print_value = true;
+  Controller quiet_controller(quiet_params);
+  Controller print_controller(print_params);
+  const rclcpp::Time command_time(1'000'000'000LL);
+
+  enqueue_hover_thrust(quiet_controller, command_time);
+  enqueue_hover_thrust(print_controller, command_time);
+  const auto sample_time = command_time + rclcpp::Duration::from_seconds(0.040);
+
+  EXPECT_TRUE(quiet_controller.estimate_thrust_model(12.0, sample_time));
+  EXPECT_TRUE(print_controller.estimate_thrust_model(12.0, sample_time));
+  EXPECT_DOUBLE_EQ(quiet_controller.thr2acc(), print_controller.thr2acc());
+  EXPECT_DOUBLE_EQ(
+    quiet_controller.debug().hover_percentage,
+    print_controller.debug().hover_percentage);
+}
+
 TEST(ThrustMapping, ClampsEstimatedHoverPercentageAtLowerBound)
 {
   auto controller = make_controller();
