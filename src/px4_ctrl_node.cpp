@@ -200,6 +200,7 @@ private:
   VehicleStatus vehicle_status_{};
   VehicleLandDetected land_detected_{};
   Eigen::Vector3d imu_acc_flu_{Eigen::Vector3d::Zero()};
+  Eigen::Quaterniond fcu_attitude_enu_flu_{Eigen::Quaterniond::Identity()};
 
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::Publisher<OffboardControlMode>::SharedPtr offboard_control_mode_pub_;
@@ -207,7 +208,6 @@ private:
   rclcpp::Publisher<VehicleAttitudeSetpoint>::SharedPtr attitude_setpoint_pub_;
   rclcpp::Publisher<VehicleRatesSetpoint>::SharedPtr rates_setpoint_pub_;
   rclcpp::Publisher<PoseStamped>::SharedPtr planner_trigger_pub_;
-  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr planner_odom_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr debug_odom_pub_;
   rclcpp::Subscription<VehicleOdometry>::SharedPtr vehicle_odometry_sub_;
   rclcpp::Subscription<Odometry>::SharedPtr nav_odom_sub_;
@@ -229,6 +229,7 @@ private:
   rclcpp::Time last_battery_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_land_detected_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_imu_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_fcu_attitude_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_cmd_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_control_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time planner_trigger_not_before_{0, 0, RCL_ROS_TIME};
@@ -243,6 +244,7 @@ private:
   bool have_battery_{false};
   bool have_land_detected_{false};
   bool have_imu_{false};
+  bool have_fcu_attitude_{false};
   bool imu_accelerometer_clipped_{false};
   bool have_cmd_{false};
   bool have_nav_state_before_offboard_{false};
@@ -254,7 +256,6 @@ private:
   bool enable_auto_arm_{false};
   bool enable_auto_takeoff_land_{false};
   bool auto_start_planner_{false};
-  bool publish_planner_odom_{true};
   bool publish_debug_odom_{true};
   bool estimate_nav_odom_velocity_{false};
   bool verbose_{false};
@@ -354,7 +355,6 @@ private:
     }
     estimate_nav_odom_velocity_ =
       declare_parameter<bool>("estimate_nav_odom_velocity", estimate_nav_odom_velocity_);
-    publish_planner_odom_ = declare_parameter<bool>("publish_planner_odom", publish_planner_odom_);
     hover_stable_pos_tol_ = declare_parameter<double>("hover_stable_pos_tol", hover_stable_pos_tol_);
     hover_stable_vel_tol_ = declare_parameter<double>("hover_stable_vel_tol", hover_stable_vel_tol_);
     hover_stable_time_ = declare_parameter<double>("hover_stable_time", hover_stable_time_);
@@ -395,7 +395,6 @@ private:
     rates_setpoint_pub_ =
       create_publisher<VehicleRatesSetpoint>("px4/in/vehicle_rates_setpoint", 10);
     planner_trigger_pub_ = create_publisher<PoseStamped>("ego/traj_start_trigger", 10);
-    planner_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("ego/odom_world", 10);
     debug_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("px4ctrl/debug_odom_enu", 10);
 
     if (odom_source_ == "nav") {
@@ -403,11 +402,15 @@ private:
         "nav/odom",
         rclcpp::QoS(20),
         std::bind(&Px4CtrlNode::nav_odometry_callback, this, std::placeholders::_1));
-    } else {
       vehicle_odometry_sub_ = create_subscription<VehicleOdometry>(
         "px4/out/vehicle_odometry",
         px4_out_qos,
         std::bind(&Px4CtrlNode::vehicle_odometry_callback, this, std::placeholders::_1));
+    } else {
+      nav_odom_sub_ = create_subscription<Odometry>(
+        "px4/odom_enu",
+        rclcpp::QoS(20),
+        std::bind(&Px4CtrlNode::nav_odometry_callback, this, std::placeholders::_1));
     }
     vehicle_status_sub_ = create_subscription<VehicleStatus>(
       "px4/out/vehicle_status_v1",
@@ -793,7 +796,7 @@ private:
     }
 
     publish_offboard_control_mode();
-    const auto output = controller_.update_alg1(des, odom_, battery_voltage_, command_time);
+    auto output = controller_.update_alg1(des, odom_, battery_voltage_, command_time);
     if (!control_output_is_finite(output)) {
       RCLCPP_ERROR_THROTTLE(
         get_logger(),
@@ -802,6 +805,19 @@ private:
         "[px4_ctrl_ros2] controller output is non-finite; skip setpoint");
       return;
     }
+    if (odom_source_ == "nav" && !params_.use_bodyrate_ctrl) {
+      const double fcu_attitude_age = (command_time - last_fcu_attitude_time_).seconds();
+      if (!have_fcu_attitude_ || !std::isfinite(fcu_attitude_age) ||
+        fcu_attitude_age < 0.0 || fcu_attitude_age >= msg_timeout_odom_)
+      {
+        RCLCPP_ERROR_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "[px4_ctrl_ros2] nav odometry requires a fresh PX4 FCU attitude; skip setpoint");
+        return;
+      }
+      output.q = align_nav_attitude_to_fcu(fcu_attitude_enu_flu_, odom_.q, output.q);
+    }
+
     if (params_.use_bodyrate_ctrl) {
       publish_rates_setpoint(output);
     } else {
@@ -1216,37 +1232,28 @@ private:
 
   void vehicle_odometry_callback(const VehicleOdometry::SharedPtr msg)
   {
-    if (msg->pose_frame != VehicleOdometry::POSE_FRAME_NED ||
-      msg->velocity_frame != VehicleOdometry::VELOCITY_FRAME_NED) {
+    if (msg->pose_frame != VehicleOdometry::POSE_FRAME_NED) {
       RCLCPP_WARN_THROTTLE(
         get_logger(),
         *get_clock(),
         2000,
-        "[px4_ctrl_ros2] vehicle_odometry frame is not NED/NED; pose_frame=%u velocity_frame=%u",
-        static_cast<unsigned>(msg->pose_frame),
-        static_cast<unsigned>(msg->velocity_frame));
-    }
-
-    const Eigen::Vector3d p_ned(msg->position[0], msg->position[1], msg->position[2]);
-    const Eigen::Vector3d v_ned(msg->velocity[0], msg->velocity[1], msg->velocity[2]);
-    const Eigen::Quaterniond q_ned_frd(msg->q[0], msg->q[1], msg->q[2], msg->q[3]);
-    if (!finite_vector3(p_ned) || !finite_vector3(v_ned) ||
-      !std::isfinite(q_ned_frd.w()) || !std::isfinite(q_ned_frd.x()) ||
-      !std::isfinite(q_ned_frd.y()) || !std::isfinite(q_ned_frd.z())) {
+        "[px4_ctrl_ros2] FCU attitude pose frame is not NED; pose_frame=%u",
+        static_cast<unsigned>(msg->pose_frame));
       return;
     }
 
-    odom_.p = ned_to_enu(p_ned);
-    odom_.v = ned_to_enu(v_ned);
-    odom_.q = ned_frd_to_enu_flu(q_ned_frd.normalized());
-    odom_.w = Eigen::Vector3d(
-      msg->angular_velocity[0],
-      -msg->angular_velocity[1],
-      -msg->angular_velocity[2]);
-    have_odom_ = true;
-    last_odom_time_ = now();
-    odom_frame_id_ = "world";
-    odom_child_frame_id_ = "base_link";
+    const Eigen::Quaterniond q_ned_frd(msg->q[0], msg->q[1], msg->q[2], msg->q[3]);
+    if (!std::isfinite(q_ned_frd.w()) || !std::isfinite(q_ned_frd.x()) ||
+      !std::isfinite(q_ned_frd.y()) || !std::isfinite(q_ned_frd.z())) {
+      return;
+    }
+    if (q_ned_frd.norm() < 1.0e-6) {
+      return;
+    }
+
+    fcu_attitude_enu_flu_ = ned_frd_to_enu_flu(q_ned_frd.normalized());
+    have_fcu_attitude_ = true;
+    last_fcu_attitude_time_ = now();
   }
 
   void nav_odometry_callback(const Odometry::SharedPtr msg)
@@ -1426,9 +1433,6 @@ private:
     }
 
     const auto msg = make_odom_msg();
-    if (publish_planner_odom_) {
-      planner_odom_pub_->publish(msg);
-    }
     if (publish_debug_odom_) {
       debug_odom_pub_->publish(msg);
     }

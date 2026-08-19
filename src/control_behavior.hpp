@@ -1,5 +1,7 @@
 #pragma once
 
+#include <Eigen/Geometry>
+
 namespace px4_ctrl_ros2
 {
 
@@ -31,6 +33,14 @@ constexpr AutoLandRcAction auto_land_rc_action(
 constexpr float attitude_yaw_sp_move_rate()
 {
   return 0.0F;
+}
+
+inline Eigen::Quaterniond align_nav_attitude_to_fcu(
+  const Eigen::Quaterniond & fcu_attitude,
+  const Eigen::Quaterniond & nav_attitude,
+  const Eigen::Quaterniond & desired_attitude)
+{
+  return (fcu_attitude * nav_attitude.inverse() * desired_attitude).normalized();
 }
 
 }  // namespace px4_ctrl_ros2

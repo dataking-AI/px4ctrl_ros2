@@ -294,16 +294,6 @@ double normalize_angle(double yaw)
   return yaw;
 }
 
-Eigen::Vector3d enu_to_ned(const Eigen::Vector3d &enu)
-{
-  return enu_to_ned_matrix() * enu;
-}
-
-Eigen::Vector3d ned_to_enu(const Eigen::Vector3d &ned)
-{
-  return enu_to_ned_matrix() * ned;
-}
-
 Eigen::Quaterniond ned_frd_to_enu_flu(const Eigen::Quaterniond &q_ned_frd)
 {
   const Eigen::Matrix3d r_enu_flu =

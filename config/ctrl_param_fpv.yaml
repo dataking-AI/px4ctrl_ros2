@@ -39,7 +39,6 @@ px4_ctrl_node:
     enable_auto_takeoff_land: false
     odom_source: "px4"
     estimate_nav_odom_velocity: false
-    publish_planner_odom: true
     hover_stable_pos_tol: 0.30
     hover_stable_vel_tol: 0.30
     hover_stable_time: 1.0

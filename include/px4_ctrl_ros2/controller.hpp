@@ -138,8 +138,6 @@ private:
 };
 
 double normalize_angle(double yaw);
-Eigen::Vector3d enu_to_ned(const Eigen::Vector3d &enu);
-Eigen::Vector3d ned_to_enu(const Eigen::Vector3d &ned);
 Eigen::Quaterniond ned_frd_to_enu_flu(const Eigen::Quaterniond &q_ned_frd);
 Eigen::Quaterniond enu_flu_to_ned_frd(const Eigen::Quaterniond &q_enu_flu);
 

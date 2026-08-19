@@ -49,7 +49,12 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "vehicle_odometry_topic",
             default_value="/fmu/out/vehicle_odometry",
-            description="PX4 vehicle odometry output topic.",
+            description="PX4 vehicle odometry used for FCU attitude alignment in nav mode.",
+        ),
+        DeclareLaunchArgument(
+            "px4_odom_enu_topic",
+            default_value="/px4/odom_enu",
+            description="Canonical ROS ENU/FLU odometry used when odom_source:=px4.",
         ),
         DeclareLaunchArgument(
             "nav_odom_topic",
@@ -102,11 +107,6 @@ def generate_launch_description():
             description="EGO PRESET_TARGET start trigger topic.",
         ),
         DeclareLaunchArgument(
-            "planner_odom_topic",
-            default_value="/drone_0_visual_slam/odom",
-            description="ENU odometry topic consumed by EGO Planner in px4ctrl mode.",
-        ),
-        DeclareLaunchArgument(
             "takeoff_land_topic",
             default_value="/px4ctrl/takeoff_land_cmd",
             description="UInt8 takeoff/land command topic: 1=takeoff, 2=land.",
@@ -127,11 +127,21 @@ def generate_launch_description():
                 {"use_sim_time": use_sim_time},
             ],
             remappings=[
-                ("px4/in/offboard_control_mode", LaunchConfiguration("offboard_control_mode_topic")),
+                (
+                    "px4/in/offboard_control_mode",
+                    LaunchConfiguration("offboard_control_mode_topic"),
+                ),
                 ("px4/in/vehicle_command", LaunchConfiguration("vehicle_command_topic")),
-                ("px4/in/vehicle_attitude_setpoint", LaunchConfiguration("vehicle_attitude_setpoint_topic")),
-                ("px4/in/vehicle_rates_setpoint", LaunchConfiguration("vehicle_rates_setpoint_topic")),
+                (
+                    "px4/in/vehicle_attitude_setpoint",
+                    LaunchConfiguration("vehicle_attitude_setpoint_topic"),
+                ),
+                (
+                    "px4/in/vehicle_rates_setpoint",
+                    LaunchConfiguration("vehicle_rates_setpoint_topic"),
+                ),
                 ("px4/out/vehicle_odometry", LaunchConfiguration("vehicle_odometry_topic")),
+                ("px4/odom_enu", LaunchConfiguration("px4_odom_enu_topic")),
                 ("nav/odom", LaunchConfiguration("nav_odom_topic")),
                 ("px4/out/vehicle_status_v1", LaunchConfiguration("vehicle_status_topic")),
                 ("px4/out/vehicle_status", LaunchConfiguration("vehicle_status_fallback_topic")),
@@ -142,10 +152,12 @@ def generate_launch_description():
                     "px4/out/sensor_combined",
                     LaunchConfiguration("sensor_combined_topic"),
                 ),
-                ("px4/out/vehicle_land_detected", LaunchConfiguration("vehicle_land_detected_topic")),
+                (
+                    "px4/out/vehicle_land_detected",
+                    LaunchConfiguration("vehicle_land_detected_topic"),
+                ),
                 ("ego/position_cmd", LaunchConfiguration("planner_pos_cmd_topic")),
                 ("ego/traj_start_trigger", LaunchConfiguration("planner_trigger_topic")),
-                ("ego/odom_world", LaunchConfiguration("planner_odom_topic")),
                 ("px4ctrl/takeoff_land_cmd", LaunchConfiguration("takeoff_land_topic")),
                 ("px4ctrl/debug_odom_enu", LaunchConfiguration("debug_odom_topic")),
             ],

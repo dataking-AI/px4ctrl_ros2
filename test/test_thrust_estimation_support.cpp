@@ -57,6 +57,34 @@ TEST(AttitudeSetpointPolicy, IgnoresYawRateFeedforward)
   EXPECT_FLOAT_EQ(0.0F, attitude_yaw_sp_move_rate());
 }
 
+TEST(AttitudeSetpointPolicy, AlignsNavWorldAttitudeToFcuWorldAttitude)
+{
+  const Eigen::Quaterniond nav_attitude(
+    Eigen::AngleAxisd(M_PI / 2.0, Eigen::Vector3d::UnitZ()));
+  const Eigen::Quaterniond fcu_attitude = Eigen::Quaterniond::Identity();
+  const Eigen::Quaterniond desired_attitude = nav_attitude;
+
+  const Eigen::Quaterniond aligned = align_nav_attitude_to_fcu(
+    fcu_attitude, nav_attitude, desired_attitude);
+  EXPECT_NEAR(std::abs(aligned.dot(Eigen::Quaterniond::Identity())), 1.0, 1.0e-12);
+}
+
+TEST(AttitudeSetpointPolicy, PreservesDesiredOffsetDuringNavAlignment)
+{
+  const Eigen::Quaterniond nav_attitude(
+    Eigen::AngleAxisd(0.4, Eigen::Vector3d::UnitZ()));
+  const Eigen::Quaterniond fcu_attitude(
+    Eigen::AngleAxisd(-0.2, Eigen::Vector3d::UnitZ()));
+  const Eigen::Quaterniond desired_offset(
+    Eigen::AngleAxisd(0.1, Eigen::Vector3d::UnitX()));
+  const Eigen::Quaterniond desired_attitude = nav_attitude * desired_offset;
+
+  const Eigen::Quaterniond aligned = align_nav_attitude_to_fcu(
+    fcu_attitude, nav_attitude, desired_attitude);
+  const Eigen::Quaterniond expected = fcu_attitude * desired_offset;
+  EXPECT_NEAR(std::abs(aligned.dot(expected)), 1.0, 1.0e-12);
+}
+
 TEST(ThrustEstimationInput, ConvertsSensorAccelerationFromFrdToFlu)
 {
   const auto acceleration_flu = sensor_acceleration_frd_to_flu({1.0f, 2.0f, -3.0f});
