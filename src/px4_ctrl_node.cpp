@@ -200,7 +200,7 @@ private:
   VehicleStatus vehicle_status_{};
   VehicleLandDetected land_detected_{};
   Eigen::Vector3d imu_acc_flu_{Eigen::Vector3d::Zero()};
-  Eigen::Quaterniond fcu_attitude_enu_flu_{Eigen::Quaterniond::Identity()};
+  Eigen::Quaterniond fcu_attitude_nwu_flu_{Eigen::Quaterniond::Identity()};
 
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::Publisher<OffboardControlMode>::SharedPtr offboard_control_mode_pub_;
@@ -395,7 +395,7 @@ private:
     rates_setpoint_pub_ =
       create_publisher<VehicleRatesSetpoint>("px4/in/vehicle_rates_setpoint", 10);
     planner_trigger_pub_ = create_publisher<PoseStamped>("ego/traj_start_trigger", 10);
-    debug_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("px4ctrl/debug_odom_enu", 10);
+    debug_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("px4ctrl/debug_odom_nwu", 10);
 
     if (odom_source_ == "nav") {
       nav_odom_sub_ = create_subscription<Odometry>(
@@ -408,7 +408,7 @@ private:
         std::bind(&Px4CtrlNode::vehicle_odometry_callback, this, std::placeholders::_1));
     } else {
       nav_odom_sub_ = create_subscription<Odometry>(
-        "px4/odom_enu",
+        "px4/odom_nwu",
         rclcpp::QoS(20),
         std::bind(&Px4CtrlNode::nav_odometry_callback, this, std::placeholders::_1));
     }
@@ -815,7 +815,7 @@ private:
           "[px4_ctrl_ros2] nav odometry requires a fresh PX4 FCU attitude; skip setpoint");
         return;
       }
-      output.q = align_nav_attitude_to_fcu(fcu_attitude_enu_flu_, odom_.q, output.q);
+      output.q = align_nav_attitude_to_fcu(fcu_attitude_nwu_flu_, odom_.q, output.q);
     }
 
     if (params_.use_bodyrate_ctrl) {
@@ -844,7 +844,7 @@ private:
 
   void publish_attitude_setpoint(const ControllerOutput &output)
   {
-    const Eigen::Quaterniond q_ned_frd = enu_flu_to_ned_frd(output.q);
+    const Eigen::Quaterniond q_ned_frd = nwu_flu_to_ned_frd(output.q);
     VehicleAttitudeSetpoint msg{};
     msg.q_d = eigen_quat_to_px4_array(q_ned_frd);
     msg.thrust_body = {0.0f, 0.0f, static_cast<float>(-output.thrust)};
@@ -1251,7 +1251,7 @@ private:
       return;
     }
 
-    fcu_attitude_enu_flu_ = ned_frd_to_enu_flu(q_ned_frd.normalized());
+    fcu_attitude_nwu_flu_ = ned_frd_to_nwu_flu(q_ned_frd.normalized());
     have_fcu_attitude_ = true;
     last_fcu_attitude_time_ = now();
   }

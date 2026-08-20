@@ -52,9 +52,9 @@ def generate_launch_description():
             description="PX4 vehicle odometry used for FCU attitude alignment in nav mode.",
         ),
         DeclareLaunchArgument(
-            "px4_odom_enu_topic",
-            default_value="/px4/odom_enu",
-            description="Canonical ROS ENU/FLU odometry used when odom_source:=px4.",
+            "px4_odom_nwu_topic",
+            default_value="/px4/odom_nwu",
+            description="Canonical ROS NWU/FLU odometry used when odom_source:=px4.",
         ),
         DeclareLaunchArgument(
             "nav_odom_topic",
@@ -113,8 +113,8 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "debug_odom_topic",
-            default_value="/px4ctrl/debug_odom_enu",
-            description="Debug ENU odometry converted from PX4 odometry.",
+            default_value="/px4ctrl/debug_odom_nwu",
+            description="Debug NWU odometry converted from PX4 odometry.",
         ),
         Node(
             package="px4_ctrl_ros2",
@@ -141,7 +141,7 @@ def generate_launch_description():
                     LaunchConfiguration("vehicle_rates_setpoint_topic"),
                 ),
                 ("px4/out/vehicle_odometry", LaunchConfiguration("vehicle_odometry_topic")),
-                ("px4/odom_enu", LaunchConfiguration("px4_odom_enu_topic")),
+                ("px4/odom_nwu", LaunchConfiguration("px4_odom_nwu_topic")),
                 ("nav/odom", LaunchConfiguration("nav_odom_topic")),
                 ("px4/out/vehicle_status_v1", LaunchConfiguration("vehicle_status_topic")),
                 ("px4/out/vehicle_status", LaunchConfiguration("vehicle_status_fallback_topic")),
@@ -159,7 +159,7 @@ def generate_launch_description():
                 ("ego/position_cmd", LaunchConfiguration("planner_pos_cmd_topic")),
                 ("ego/traj_start_trigger", LaunchConfiguration("planner_trigger_topic")),
                 ("px4ctrl/takeoff_land_cmd", LaunchConfiguration("takeoff_land_topic")),
-                ("px4ctrl/debug_odom_enu", LaunchConfiguration("debug_odom_topic")),
+                ("px4ctrl/debug_odom_nwu", LaunchConfiguration("debug_odom_topic")),
             ],
         ),
     ])

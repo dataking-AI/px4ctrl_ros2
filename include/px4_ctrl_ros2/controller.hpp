@@ -138,7 +138,7 @@ private:
 };
 
 double normalize_angle(double yaw);
-Eigen::Quaterniond ned_frd_to_enu_flu(const Eigen::Quaterniond &q_ned_frd);
-Eigen::Quaterniond enu_flu_to_ned_frd(const Eigen::Quaterniond &q_enu_flu);
+Eigen::Quaterniond ned_frd_to_nwu_flu(const Eigen::Quaterniond &q_ned_frd);
+Eigen::Quaterniond nwu_flu_to_ned_frd(const Eigen::Quaterniond &q_nwu_flu);
 
 }  // namespace px4_ctrl_ros2

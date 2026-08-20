@@ -76,6 +76,21 @@ if(BUILD_TESTING)
     Eigen3::Eigen
   )
 
+  ament_add_gtest(test_coordinate_conversion
+    test/test_coordinate_conversion.cpp
+    src/controller.cpp
+  )
+  target_include_directories(test_coordinate_conversion PRIVATE
+    include
+  )
+  ament_target_dependencies(test_coordinate_conversion
+    rclcpp
+    Eigen3
+  )
+  target_link_libraries(test_coordinate_conversion
+    Eigen3::Eigen
+  )
+
   ament_add_gtest(test_thrust_estimation_support
     test/test_thrust_estimation_support.cpp
   )

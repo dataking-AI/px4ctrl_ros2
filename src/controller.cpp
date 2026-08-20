@@ -10,11 +10,11 @@ namespace px4_ctrl_ros2
 
 namespace
 {
-Eigen::Matrix3d enu_to_ned_matrix()
+Eigen::Matrix3d nwu_to_ned_matrix()
 {
   Eigen::Matrix3d m;
-  m << 0.0, 1.0, 0.0,
-       1.0, 0.0, 0.0,
+  m << 1.0, 0.0, 0.0,
+       0.0, -1.0, 0.0,
        0.0, 0.0, -1.0;
   return m;
 }
@@ -294,17 +294,17 @@ double normalize_angle(double yaw)
   return yaw;
 }
 
-Eigen::Quaterniond ned_frd_to_enu_flu(const Eigen::Quaterniond &q_ned_frd)
+Eigen::Quaterniond ned_frd_to_nwu_flu(const Eigen::Quaterniond &q_ned_frd)
 {
-  const Eigen::Matrix3d r_enu_flu =
-    enu_to_ned_matrix().transpose() * q_ned_frd.toRotationMatrix() * flu_to_frd_matrix();
-  return Eigen::Quaterniond(r_enu_flu).normalized();
+  const Eigen::Matrix3d r_nwu_flu =
+    nwu_to_ned_matrix().transpose() * q_ned_frd.toRotationMatrix() * flu_to_frd_matrix();
+  return Eigen::Quaterniond(r_nwu_flu).normalized();
 }
 
-Eigen::Quaterniond enu_flu_to_ned_frd(const Eigen::Quaterniond &q_enu_flu)
+Eigen::Quaterniond nwu_flu_to_ned_frd(const Eigen::Quaterniond &q_nwu_flu)
 {
   const Eigen::Matrix3d r_ned_frd =
-    enu_to_ned_matrix() * q_enu_flu.toRotationMatrix() * flu_to_frd_matrix().transpose();
+    nwu_to_ned_matrix() * q_nwu_flu.toRotationMatrix() * flu_to_frd_matrix().transpose();
   return Eigen::Quaterniond(r_ned_frd).normalized();
 }
 
