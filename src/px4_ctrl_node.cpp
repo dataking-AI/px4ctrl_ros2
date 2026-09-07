@@ -232,6 +232,8 @@ private:
   rclcpp::Time last_fcu_attitude_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_cmd_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_control_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_setpoint_publish_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_nav_odom_callback_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time planner_trigger_not_before_{0, 0, RCL_ROS_TIME};
   rclcpp::Time offboard_exit_start_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_offboard_exit_request_time_{0, 0, RCL_ROS_TIME};
@@ -264,6 +266,7 @@ private:
   bool reverse_yaw_{false};
   bool reverse_throttle_{true};
   double msg_timeout_odom_{0.5};
+  double msg_timeout_status_{2.0};
   double msg_timeout_rc_{0.5};
   double msg_timeout_cmd_{0.5};
   double msg_timeout_bat_{0.5};
@@ -279,6 +282,10 @@ private:
   uint64_t imu_sample_id_{0};
   uint64_t last_consumed_imu_sample_id_{0};
   uint64_t offboard_setpoint_counter_{0};
+  uint64_t offboard_control_mode_publish_count_{0};
+  uint64_t attitude_setpoint_publish_count_{0};
+  uint64_t rates_setpoint_publish_count_{0};
+  uint64_t nav_odom_callback_count_{0};
   uint32_t active_planner_traj_id_{0};
   uint32_t completed_planner_traj_id_{0};
   uint8_t takeoff_land_command_{0};
@@ -286,12 +293,16 @@ private:
   Eigen::Vector3d hover_position_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d last_nav_odom_position_{Eigen::Vector3d::Zero()};
   double hover_yaw_{0.0};
+  double nav_odom_last_gap_{-1.0};
+  double nav_odom_max_gap_{-1.0};
   double takeoff_spoolup_time_{3.0};
   double takeoff_trigger_delay_{2.0};
+  double takeoff_link_loss_timeout_{0.5};
   std::string odom_source_{"px4"};
   std::string odom_frame_id_{"world"};
   std::string odom_child_frame_id_{"base_link"};
   rclcpp::Time takeoff_spool_start_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time takeoff_link_loss_start_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_nav_odom_stamp_{0, 0, RCL_ROS_TIME};
   rclcpp::Time hover_stable_start_time_{0, 0, RCL_ROS_TIME};
 
@@ -331,6 +342,7 @@ private:
   void read_runtime_params()
   {
     msg_timeout_odom_ = declare_parameter<double>("msg_timeout_odom", msg_timeout_odom_);
+    msg_timeout_status_ = declare_parameter<double>("msg_timeout_status", msg_timeout_status_);
     msg_timeout_rc_ = declare_parameter<double>("msg_timeout_rc", msg_timeout_rc_);
     msg_timeout_cmd_ = declare_parameter<double>("msg_timeout_cmd", msg_timeout_cmd_);
     msg_timeout_bat_ = declare_parameter<double>("msg_timeout_bat", msg_timeout_bat_);
@@ -364,6 +376,8 @@ private:
       0.0, declare_parameter<double>("takeoff_spoolup_time", takeoff_spoolup_time_));
     takeoff_trigger_delay_ = std::max(
       0.0, declare_parameter<double>("takeoff_trigger_delay", takeoff_trigger_delay_));
+    takeoff_link_loss_timeout_ = std::max(
+      0.0, declare_parameter<double>("takeoff_link_loss_timeout", takeoff_link_loss_timeout_));
     publish_debug_odom_ = declare_parameter<bool>("publish_debug_odom", publish_debug_odom_);
     verbose_ = declare_parameter<bool>("verbose", verbose_);
     battery_voltage_ = params_.low_voltage;
@@ -531,6 +545,7 @@ private:
       hover_position_ = odom_.p;
       hover_yaw_ = yaw_from_quaternion(odom_.q);
       takeoff_spool_start_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+      takeoff_link_loss_start_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
       planner_trigger_not_before_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
 
       planner_trigger_sent_for_command_ = false;
@@ -647,9 +662,25 @@ private:
     }
 
     if (!vehicle_is_offboard() || !vehicle_is_armed()) {
-      transition_to(FlightState::FAILSAFE, "Offboard or armed state lost during takeoff");
+      // PX4 publishes vehicle_status at 2 Hz (Commander.cpp publishes it every
+      // 500 ms or on change), so a single stale sample must not be treated as a
+      // real loss of Offboard or armed state.
+      const auto current_time = now();
+      if (takeoff_link_loss_start_time_.nanoseconds() == 0) {
+        takeoff_link_loss_start_time_ = current_time;
+      }
+      const double lost_seconds = (current_time - takeoff_link_loss_start_time_).seconds();
+      if (lost_seconds >= takeoff_link_loss_timeout_) {
+        transition_to(FlightState::FAILSAFE, "Offboard or armed state lost during takeoff");
+      } else {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 500,
+          "[px4_ctrl_ros2] offboard/armed link lost for %.2fs during takeoff; waiting for recovery",
+          lost_seconds);
+      }
       return;
     }
+    takeoff_link_loss_start_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
 
     const double elapsed = (now() - takeoff_spool_start_time_).seconds();
 
@@ -795,7 +826,6 @@ private:
       }
     }
 
-    publish_offboard_control_mode();
     auto output = controller_.update_alg1(des, odom_, battery_voltage_, command_time);
     if (!control_output_is_finite(output)) {
       RCLCPP_ERROR_THROTTLE(
@@ -817,6 +847,12 @@ private:
       }
       output.q = align_nav_attitude_to_fcu(fcu_attitude_nwu_flu_, odom_.q, output.q);
     }
+
+    // Publish the Offboard heartbeat only when a matching, valid setpoint is
+    // ready. If any prerequisite above fails, withholding the heartbeat lets
+    // PX4's Offboard-loss failsafe take over instead of advertising a live
+    // control link while leaving PX4 with a stale attitude/rate setpoint.
+    publish_offboard_control_mode();
 
     if (params_.use_bodyrate_ctrl) {
       publish_rates_setpoint(output);
@@ -840,6 +876,7 @@ private:
     msg.direct_actuator = false;
     msg.timestamp = timestamp_us();
     offboard_control_mode_pub_->publish(msg);
+    offboard_control_mode_publish_count_++;
   }
 
   void publish_attitude_setpoint(const ControllerOutput &output)
@@ -853,6 +890,8 @@ private:
     msg.fw_control_yaw_wheel = false;
     msg.timestamp = timestamp_us();
     attitude_setpoint_pub_->publish(msg);
+    attitude_setpoint_publish_count_++;
+    last_setpoint_publish_time_ = now();
   }
 
   void publish_rates_setpoint(const ControllerOutput &output)
@@ -865,6 +904,8 @@ private:
     msg.reset_integral = false;
     msg.timestamp = timestamp_us();
     rates_setpoint_pub_->publish(msg);
+    rates_setpoint_publish_count_++;
+    last_setpoint_publish_time_ = now();
   }
 
   void maybe_request_offboard_and_arm()
@@ -1093,7 +1134,7 @@ private:
 
   bool status_ready()
   {
-    return have_status_ && (now() - last_status_time_).seconds() < msg_timeout_odom_;
+    return have_status_ && (now() - last_status_time_).seconds() < msg_timeout_status_;
   }
 
   bool rc_control_available()
@@ -1283,6 +1324,14 @@ private:
       return;
     }
 
+    const auto callback_time = now();
+    if (last_nav_odom_callback_time_.nanoseconds() != 0) {
+      nav_odom_last_gap_ = (callback_time - last_nav_odom_callback_time_).seconds();
+      nav_odom_max_gap_ = std::max(nav_odom_max_gap_, nav_odom_last_gap_);
+    }
+    last_nav_odom_callback_time_ = callback_time;
+    nav_odom_callback_count_++;
+
     const rclcpp::Time msg_time =
       msg->header.stamp.sec == 0 && msg->header.stamp.nanosec == 0 ?
       now() : rclcpp::Time(msg->header.stamp);
@@ -1298,7 +1347,7 @@ private:
     odom_.q = q.normalized();
     odom_.w = w;
     have_odom_ = true;
-    last_odom_time_ = now();
+    last_odom_time_ = callback_time;
     last_nav_odom_stamp_ = msg_time;
     last_nav_odom_position_ = p;
     odom_frame_id_ = msg->header.frame_id.empty() ? "world" : msg->header.frame_id;
@@ -1441,8 +1490,14 @@ private:
   void log_diagnostics()
   {
     const auto throttle_ms = verbose_ ? 1000 : 5000;
+    const auto current_time = now();
     const bool battery_ready =
-      have_battery_ && (now() - last_battery_time_).seconds() < msg_timeout_bat_;
+      have_battery_ && (current_time - last_battery_time_).seconds() < msg_timeout_bat_;
+    const double odom_age = have_odom_ ? (current_time - last_odom_time_).seconds() : -1.0;
+    const double fcu_attitude_age =
+      have_fcu_attitude_ ? (current_time - last_fcu_attitude_time_).seconds() : -1.0;
+    const double setpoint_age = last_setpoint_publish_time_.nanoseconds() != 0 ?
+      (current_time - last_setpoint_publish_time_).seconds() : -1.0;
     RCLCPP_INFO_THROTTLE(
       get_logger(),
       *get_clock(),
@@ -1461,6 +1516,22 @@ private:
       odom_.p.z(),
       (odom_.p - hover_position_).norm(),
       odom_.v.norm());
+
+    // RCLCPP_INFO_THROTTLE(
+    //   get_logger(), *get_clock(), 1000,
+    //   "[px4_ctrl_ros2] outputs: offboard_mode=%lu attitude_sp=%lu rates_sp=%lu "
+    //   "subs(offboard=%zu attitude=%zu rates=%zu) "
+    //   "age(setpoint=%.3fs fcu_att=%.3fs nav_odom=%.3fs) "
+    //   "nav_odom(count=%lu last_gap=%.3fs max_gap=%.3fs)",
+    //   static_cast<unsigned long>(offboard_control_mode_publish_count_),
+    //   static_cast<unsigned long>(attitude_setpoint_publish_count_),
+    //   static_cast<unsigned long>(rates_setpoint_publish_count_),
+    //   offboard_control_mode_pub_->get_subscription_count(),
+    //   attitude_setpoint_pub_->get_subscription_count(),
+    //   rates_setpoint_pub_->get_subscription_count(),
+    //   setpoint_age, fcu_attitude_age, odom_age,
+    //   static_cast<unsigned long>(nav_odom_callback_count_),
+    //   nav_odom_last_gap_, nav_odom_max_gap_);
 
     if (!verbose_) {
       return;

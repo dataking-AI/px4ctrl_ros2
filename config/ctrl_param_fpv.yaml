@@ -10,7 +10,7 @@ px4_ctrl_node:
     max_manual_vel: 1.0
     max_angle: 30.0
     low_voltage: 14.0
-    hover_percentage: 0.78
+    hover_percentage: 0.5
     accurate_thrust_model: false
     thrust_model_print_value: false
     thrust_model_k1: 0.7583
@@ -26,6 +26,7 @@ px4_ctrl_node:
     pos_error_limit: 1.5
     vel_error_limit: 1.5
     msg_timeout_odom: 0.5
+    msg_timeout_status: 1.5
     msg_timeout_rc: 0.5
     msg_timeout_cmd: 0.5
     msg_timeout_bat: 0.5
@@ -45,6 +46,7 @@ px4_ctrl_node:
     takeoff_height: 1.0
     takeoff_spoolup_time: 3.0
     takeoff_trigger_delay: 2.0
+    takeoff_link_loss_timeout: 0.5
     takeoff_land_speed: 0.14
     publish_debug_odom: true
     verbose: false
