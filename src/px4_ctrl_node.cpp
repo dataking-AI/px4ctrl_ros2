@@ -155,7 +155,7 @@ struct RcState
 class Px4CtrlNode : public rclcpp::Node
 {
 public:
-  Px4CtrlNode() : Node("px4_ctrl_node"), controller_(read_control_params())
+  Px4CtrlNode() : Node("px4_ctrl_node"), params_(read_control_params()), controller_(params_)
   {
     read_runtime_params();
     setup_ros_interfaces();
@@ -166,11 +166,16 @@ public:
     timer_ = create_wall_timer(period, std::bind(&Px4CtrlNode::control_loop, this));
     RCLCPP_INFO(
       get_logger(),
-      "[px4_ctrl_ros2] started | freq=%.1fHz output=%s bodyrate=%s rc_required=%s",
+      "[px4_ctrl_ros2] started | freq=%.1fHz output=%s bodyrate=%s rc_required=%s "
+      "thrust(print=%s accurate=%s hover=%.3f gra=%.3f)",
       frequency,
       yes_no(enable_offboard_command_),
       yes_no(params_.use_bodyrate_ctrl),
-      yes_no(rc_required_));
+      yes_no(rc_required_),
+      yes_no(params_.thrust_model_print_value),
+      yes_no(params_.accurate_thrust_model),
+      params_.hover_percentage,
+      params_.gra);
   }
 
 private:
@@ -824,6 +829,29 @@ private:
           controller_.debug().hover_percentage,
           controller_.debug().thr2acc);
       }
+      if (!thrust_model_updated) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "[px4_ctrl_ros2] thrust estimate not updated: status=%s acc_flu_z=%.3f "
+          "elapsed=%.4fs input_thrust=%.3f queue=%zu",
+          thrust_estimate_status_name(controller_.debug().thrust_estimate_status),
+          controller_.debug().thrust_estimate_body_acc_z,
+          controller_.debug().thrust_estimate_elapsed,
+          controller_.debug().thrust_estimate_input_thrust,
+          controller_.debug().thrust_estimate_queue_size);
+      }
+    } else if ((state_ == FlightState::AUTO_HOVER || state_ == FlightState::CMD_CTRL) &&
+      (!have_imu_ || imu_sample_id_ == 0 ||
+      imu_sample_id_ != last_consumed_imu_sample_id_)) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "[px4_ctrl_ros2] thrust estimate input rejected: have_imu=%s clipped=%s "
+        "acc_flu=(%.3f, %.3f, %.3f) sample_id=%lu consumed_id=%lu age=%.3fs",
+        yes_no(have_imu_), yes_no(imu_accelerometer_clipped_),
+        imu_acc_flu_.x(), imu_acc_flu_.y(), imu_acc_flu_.z(),
+        static_cast<unsigned long>(imu_sample_id_),
+        static_cast<unsigned long>(last_consumed_imu_sample_id_),
+        have_imu_ ? (command_time - last_imu_time_).seconds() : -1.0);
     }
 
     auto output = controller_.update_alg1(des, odom_, battery_voltage_, command_time);

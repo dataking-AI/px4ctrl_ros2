@@ -88,31 +88,46 @@ ControllerOutput Controller::update_alg1(
 bool Controller::estimate_thrust_model(double body_acc_z, const rclcpp::Time &sample_time)
 {
   debug_.thrust_estimate_clamped = false;
+  debug_.thrust_estimate_status = ThrustEstimateStatus::NOT_ATTEMPTED;
+  debug_.thrust_estimate_body_acc_z = body_acc_z;
+  debug_.thrust_estimate_elapsed = NAN;
+  debug_.thrust_estimate_input_thrust = NAN;
+  debug_.thrust_estimate_queue_size = timed_thrust_.size();
   if (!std::isfinite(body_acc_z) || body_acc_z <= 0.0 ||
     !std::isfinite(params_.gra) || params_.gra <= 0.0)
   {
+    debug_.thrust_estimate_status = ThrustEstimateStatus::INVALID_INPUT;
     return false;
   }
 
+  bool stale_sample_dropped = false;
   while (!timed_thrust_.empty()) {
     const auto &timed_thrust = timed_thrust_.front();
     const double elapsed = (sample_time - timed_thrust.first).seconds();
+    debug_.thrust_estimate_elapsed = elapsed;
+    debug_.thrust_estimate_input_thrust = timed_thrust.second;
     if (elapsed > kThrustDelayMaxSeconds) {
       timed_thrust_.pop();
+      stale_sample_dropped = true;
       continue;
     }
     if (elapsed < kThrustDelayMinSeconds) {
+      debug_.thrust_estimate_status = stale_sample_dropped ?
+        ThrustEstimateStatus::STALE_THRUST_SAMPLE :
+        ThrustEstimateStatus::WAITING_FOR_DELAY;
       return false;
     }
 
     const double thrust = timed_thrust.second;
     timed_thrust_.pop();
     if (!std::isfinite(thrust) || thrust <= 0.0) {
+      debug_.thrust_estimate_status = ThrustEstimateStatus::INVALID_UPDATE;
       return false;
     }
 
     const double denominator = kThrustModelRho2 + thrust * P_ * thrust;
     if (!std::isfinite(denominator) || denominator <= 0.0) {
+      debug_.thrust_estimate_status = ThrustEstimateStatus::INVALID_UPDATE;
       return false;
     }
 
@@ -122,11 +137,13 @@ bool Controller::estimate_thrust_model(double body_acc_z, const rclcpp::Time &sa
     if (!std::isfinite(updated_thr2acc) || updated_thr2acc <= 0.0 ||
       !std::isfinite(updated_covariance) || updated_covariance <= 0.0)
     {
+      debug_.thrust_estimate_status = ThrustEstimateStatus::INVALID_UPDATE;
       return false;
     }
 
     const double estimated_hover_percentage = params_.gra / updated_thr2acc;
     if (!std::isfinite(estimated_hover_percentage) || estimated_hover_percentage <= 0.0) {
+      debug_.thrust_estimate_status = ThrustEstimateStatus::INVALID_UPDATE;
       return false;
     }
     const double bounded_hover_percentage = std::clamp(
@@ -139,8 +156,12 @@ bool Controller::estimate_thrust_model(double body_acc_z, const rclcpp::Time &sa
     debug_.thr2acc = thr2acc_;
     debug_.hover_percentage = bounded_hover_percentage;
     debug_.thrust_estimate_clamped = bounded_hover_percentage != estimated_hover_percentage;
+    debug_.thrust_estimate_status = ThrustEstimateStatus::UPDATED;
     return true;
   }
+  debug_.thrust_estimate_status = stale_sample_dropped ?
+    ThrustEstimateStatus::STALE_THRUST_SAMPLE :
+    ThrustEstimateStatus::NO_THRUST_SAMPLE;
   return false;
 }
 

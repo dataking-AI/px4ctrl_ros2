@@ -58,6 +58,31 @@ struct DesiredState
   double yaw_rate{0.0};
 };
 
+enum class ThrustEstimateStatus : uint8_t
+{
+  NOT_ATTEMPTED = 0,
+  INVALID_INPUT,
+  NO_THRUST_SAMPLE,
+  WAITING_FOR_DELAY,
+  STALE_THRUST_SAMPLE,
+  INVALID_UPDATE,
+  UPDATED
+};
+
+inline const char * thrust_estimate_status_name(ThrustEstimateStatus status)
+{
+  switch (status) {
+    case ThrustEstimateStatus::NOT_ATTEMPTED: return "not_attempted";
+    case ThrustEstimateStatus::INVALID_INPUT: return "invalid_input";
+    case ThrustEstimateStatus::NO_THRUST_SAMPLE: return "no_thrust_sample";
+    case ThrustEstimateStatus::WAITING_FOR_DELAY: return "waiting_for_delay";
+    case ThrustEstimateStatus::STALE_THRUST_SAMPLE: return "stale_thrust_sample";
+    case ThrustEstimateStatus::INVALID_UPDATE: return "invalid_update";
+    case ThrustEstimateStatus::UPDATED: return "updated";
+  }
+  return "unknown";
+}
+
 struct ControllerOutput
 {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -79,6 +104,11 @@ struct DebugValues
   double thr2acc{0.0};
   double hover_percentage{0.0};
   bool thrust_estimate_clamped{false};
+  ThrustEstimateStatus thrust_estimate_status{ThrustEstimateStatus::NOT_ATTEMPTED};
+  double thrust_estimate_body_acc_z{NAN};
+  double thrust_estimate_elapsed{NAN};
+  double thrust_estimate_input_thrust{NAN};
+  std::size_t thrust_estimate_queue_size{0};
 };
 
 class Controller
@@ -110,8 +140,8 @@ private:
   static constexpr double kThrustModelRho2 = 0.998;
   static constexpr double kMinEstimatedHoverPercentage = 0.1;
   static constexpr double kMaxEstimatedHoverPercentage = 0.8;
-  static constexpr double kThrustDelayMinSeconds = 0.035;
-  static constexpr double kThrustDelayMaxSeconds = 0.045;
+  static constexpr double kThrustDelayMinSeconds = 0.035; // gazebo 使用0.020
+  static constexpr double kThrustDelayMaxSeconds = 0.045; // gazebo 使用0.060
   static constexpr std::size_t kMaxTimedThrustSamples = 100;
   double P_{1.0e6};
 
