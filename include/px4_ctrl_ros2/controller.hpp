@@ -140,8 +140,8 @@ private:
   static constexpr double kThrustModelRho2 = 0.998;
   static constexpr double kMinEstimatedHoverPercentage = 0.1;
   static constexpr double kMaxEstimatedHoverPercentage = 0.8;
-  static constexpr double kThrustDelayMinSeconds = 0.035; // gazebo 使用0.020
-  static constexpr double kThrustDelayMaxSeconds = 0.045; // gazebo 使用0.060
+  static constexpr double kThrustDelayMinSeconds = 0.025; // gazebo 使用0.020
+  static constexpr double kThrustDelayMaxSeconds = 0.040; // gazebo 使用0.060
   static constexpr std::size_t kMaxTimedThrustSamples = 100;
   double P_{1.0e6};
 

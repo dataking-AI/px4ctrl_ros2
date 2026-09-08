@@ -91,6 +91,20 @@ if(BUILD_TESTING)
     Eigen3::Eigen
   )
 
+  ament_add_gtest(test_land_detector
+    test/test_land_detector.cpp
+  )
+  target_include_directories(test_land_detector PRIVATE
+    src
+  )
+  ament_target_dependencies(test_land_detector
+    rclcpp
+    Eigen3
+  )
+  target_link_libraries(test_land_detector
+    Eigen3::Eigen
+  )
+
   ament_add_gtest(test_thrust_estimation_support
     test/test_thrust_estimation_support.cpp
   )

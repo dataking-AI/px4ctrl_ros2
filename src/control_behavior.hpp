@@ -2,6 +2,9 @@
 
 #include <Eigen/Geometry>
 
+#include <algorithm>
+#include <cmath>
+
 namespace px4_ctrl_ros2
 {
 
@@ -33,6 +36,19 @@ constexpr AutoLandRcAction auto_land_rc_action(
 constexpr float attitude_yaw_sp_move_rate()
 {
   return 0.0F;
+}
+
+// Lowest z the RC stick may command the hover setpoint to. It is a world-frame
+// constant like in PX4Ctrl, not a measured ground height, so it never depends
+// on where the odometry origin happens to be.
+constexpr double kMinHoverZSetpoint = -0.3;
+
+inline double clamp_hover_z_setpoint(double proposed_z)
+{
+  if (!std::isfinite(proposed_z)) {
+    return kMinHoverZSetpoint;
+  }
+  return std::max(proposed_z, kMinHoverZSetpoint);
 }
 
 inline Eigen::Quaterniond align_nav_attitude_to_fcu(

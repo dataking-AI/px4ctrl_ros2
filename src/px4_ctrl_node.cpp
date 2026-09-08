@@ -1,6 +1,7 @@
 #include "px4_ctrl_ros2/controller.hpp"
 #include "control_behavior.hpp"
 #include "flight_state.hpp"
+#include "land_detector.hpp"
 #include "thrust_estimation_input.hpp"
 #include "vehicle_command_authorization.hpp"
 
@@ -203,7 +204,7 @@ private:
   DesiredState exit_hold_des_{};
   PositionCommand planner_cmd_{};
   VehicleStatus vehicle_status_{};
-  VehicleLandDetected land_detected_{};
+  VehicleLandDetected vehicle_land_detected_{};
   Eigen::Vector3d imu_acc_flu_{Eigen::Vector3d::Zero()};
   Eigen::Quaterniond fcu_attitude_nwu_flu_{Eigen::Quaterniond::Identity()};
 
@@ -218,21 +219,23 @@ private:
   rclcpp::Subscription<Odometry>::SharedPtr nav_odom_sub_;
   rclcpp::Subscription<VehicleStatus>::SharedPtr vehicle_status_sub_;
   rclcpp::Subscription<VehicleStatus>::SharedPtr vehicle_status_fallback_sub_;
+  rclcpp::Subscription<VehicleLandDetected>::SharedPtr vehicle_land_detected_sub_;
   rclcpp::Subscription<ManualControlSetpoint>::SharedPtr manual_control_sub_;
   rclcpp::Subscription<InputRc>::SharedPtr input_rc_sub_;
   rclcpp::Subscription<BatteryStatus>::SharedPtr battery_sub_;
-  rclcpp::Subscription<VehicleLandDetected>::SharedPtr land_detected_sub_;
   rclcpp::Subscription<SensorCombined>::SharedPtr sensor_combined_sub_;
   rclcpp::Subscription<PositionCommand>::SharedPtr planner_cmd_sub_;
   rclcpp::Subscription<UInt8>::SharedPtr takeoff_land_sub_;
 
   FlightState state_{FlightState::MANUAL_CTRL};
+  FlightState previous_state_{FlightState::MANUAL_CTRL};
+  LandDetector land_detector_{};
   rclcpp::Time state_enter_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_odom_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_status_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_vehicle_land_detected_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_rc_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_battery_time_{0, 0, RCL_ROS_TIME};
-  rclcpp::Time last_land_detected_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_imu_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_fcu_attitude_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_cmd_time_{0, 0, RCL_ROS_TIME};
@@ -249,7 +252,6 @@ private:
   bool have_status_{false};
   bool have_rc_{false};
   bool have_battery_{false};
-  bool have_land_detected_{false};
   bool have_imu_{false};
   bool have_fcu_attitude_{false};
   bool imu_accelerometer_clipped_{false};
@@ -269,9 +271,11 @@ private:
   bool reverse_roll_{false};
   bool reverse_pitch_{false};
   bool reverse_yaw_{false};
-  bool reverse_throttle_{true};
+  bool reverse_throttle_{false};
+  bool have_desired_z_{false};
   double msg_timeout_odom_{0.5};
   double msg_timeout_status_{2.0};
+  double msg_timeout_vehicle_land_detected_{0.5};
   double msg_timeout_rc_{0.5};
   double msg_timeout_cmd_{0.5};
   double msg_timeout_bat_{0.5};
@@ -281,6 +285,7 @@ private:
   double hover_stable_time_{1.0};
   double takeoff_height_{1.0};
   double takeoff_land_speed_{0.14};
+  double last_desired_z_{0.0};
   double battery_voltage_{14.0};
   double offboard_exit_timeout_{1.0};
   double offboard_exit_retry_interval_{0.2};
@@ -348,6 +353,8 @@ private:
   {
     msg_timeout_odom_ = declare_parameter<double>("msg_timeout_odom", msg_timeout_odom_);
     msg_timeout_status_ = declare_parameter<double>("msg_timeout_status", msg_timeout_status_);
+    msg_timeout_vehicle_land_detected_ = declare_parameter<double>(
+      "msg_timeout_vehicle_land_detected", msg_timeout_vehicle_land_detected_);
     msg_timeout_rc_ = declare_parameter<double>("msg_timeout_rc", msg_timeout_rc_);
     msg_timeout_cmd_ = declare_parameter<double>("msg_timeout_cmd", msg_timeout_cmd_);
     msg_timeout_bat_ = declare_parameter<double>("msg_timeout_bat", msg_timeout_bat_);
@@ -439,6 +446,10 @@ private:
       "px4/out/vehicle_status",
       px4_out_qos,
       std::bind(&Px4CtrlNode::vehicle_status_callback, this, std::placeholders::_1));
+    vehicle_land_detected_sub_ = create_subscription<VehicleLandDetected>(
+      "px4/out/vehicle_land_detected",
+      px4_out_qos,
+      std::bind(&Px4CtrlNode::vehicle_land_detected_callback, this, std::placeholders::_1));
     manual_control_sub_ = create_subscription<ManualControlSetpoint>(
       "px4/out/manual_control_setpoint",
       px4_out_qos,
@@ -451,10 +462,6 @@ private:
       "px4/out/battery_status",
       px4_out_qos,
       std::bind(&Px4CtrlNode::battery_callback, this, std::placeholders::_1));
-    land_detected_sub_ = create_subscription<VehicleLandDetected>(
-      "px4/out/vehicle_land_detected",
-      px4_out_qos,
-        std::bind(&Px4CtrlNode::land_detected_callback, this, std::placeholders::_1));
     sensor_combined_sub_ = create_subscription<SensorCombined>(
       "px4/out/sensor_combined",
       px4_out_qos,
@@ -495,7 +502,7 @@ private:
         handle_auto_hover_state(dt);
         break;
       case FlightState::CMD_CTRL:
-        handle_cmd_ctrl_state(dt);
+        handle_cmd_ctrl_state();
         break;
       case FlightState::AUTO_TAKEOFF:
         handle_auto_takeoff_state();
@@ -510,6 +517,8 @@ private:
         handle_failsafe_state();
         break;
     }
+
+    update_land_detector();
   }
 
   void handle_manual_state()
@@ -531,7 +540,7 @@ private:
         takeoff_land_command_ = 0;
         return;
       }
-      if (have_land_detected_ && !land_detected_.landed) {
+      if (!land_detector_.landed) {
         RCLCPP_ERROR(
           get_logger(),
           "[px4_ctrl_ros2] Reject AUTO_TAKEOFF. land detector says that the drone is not landed now!");
@@ -589,6 +598,7 @@ private:
 
     if (takeoff_land_command_ == kLandCommand && enable_auto_takeoff_land_) {
       takeoff_land_command_ = 0;
+      set_hover_from_current(0.0);
       transition_to(FlightState::AUTO_LAND, "land command accepted");
       return;
     }
@@ -616,7 +626,7 @@ private:
     }
   }
 
-  void handle_cmd_ctrl_state(double dt)
+  void handle_cmd_ctrl_state()
   {
     if (takeoff_land_command_ == kLandCommand && enable_auto_takeoff_land_) {
       RCLCPP_ERROR(
@@ -632,6 +642,7 @@ private:
     }
 
     if (rc_required_ && !rc_.is_command_mode) {
+      set_hover_from_current(0.0);
       transition_to(FlightState::AUTO_HOVER, "RC command switch released");
       return;
     }
@@ -647,7 +658,6 @@ private:
       return;
     }
 
-    update_hover_from_rc(dt);
     publish_control(planner_des_);
   }
 
@@ -711,7 +721,6 @@ private:
       transition_to(FlightState::FAILSAFE, "odometry lost during land");
       return;
     }
-
     switch (auto_land_rc_action(
         rc_required_, rc_control_available(), rc_.is_hover_mode, rc_.is_command_mode))
     {
@@ -726,10 +735,10 @@ private:
         break;
     }
 
-    hover_position_.z() = std::max(0.0, hover_position_.z() - takeoff_land_speed_ * dt);
+    hover_position_.z() -= takeoff_land_speed_ * dt;
     publish_control(make_hover_desired());
 
-    if (have_land_detected_ && land_detected_.landed) {
+    if (land_detector_.landed) {
       if (vehicle_is_armed()) {
         if (!enable_auto_arm_) {
           RCLCPP_WARN_THROTTLE(
@@ -737,6 +746,15 @@ private:
             *get_clock(),
             5000,
             "[px4_ctrl_ros2] landed but still armed; waiting for manual disarm");
+          return;
+        }
+
+        // Require an independent, fresh PX4 land-detector confirmation
+        // before sending an automatic disarm command.
+        if (!vehicle_land_detected_ready() || !vehicle_land_detected_.landed) {
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 2000,
+            "[px4_ctrl_ros2] local landing detected; waiting for fresh PX4 landed confirmation before disarm");
           return;
         }
 
@@ -798,6 +816,9 @@ private:
 
   void publish_control(const DesiredState &des)
   {
+    last_desired_z_ = des.p.z();
+    have_desired_z_ = std::isfinite(des.p.z());
+
     if (!enable_offboard_command_) {
       return;
     }
@@ -1064,8 +1085,19 @@ private:
     hover_position_.x() += pitch * params_.max_manual_vel * dt;
     hover_position_.y() += roll * params_.max_manual_vel * dt;
     hover_position_.z() += throttle * params_.max_manual_vel * dt;
-    hover_position_.z() = std::max(0.0, hover_position_.z());
+    hover_position_.z() = clamp_hover_z_setpoint(hover_position_.z());
     hover_yaw_ = normalize_angle(hover_yaw_ + yaw * params_.max_manual_vel * dt);
+  }
+
+  // Touchdown detection follows PX4Ctrl: the controller keeps asking for a
+  // lower position while the drone stays still.
+  void update_land_detector()
+  {
+    land_detector_.update(
+      previous_state_, state_, vehicle_is_armed(),
+      have_desired_z_ ? last_desired_z_ : std::numeric_limits<double>::quiet_NaN(),
+      odom_.p.z(), odom_.v.norm(), now());
+    previous_state_ = state_;
   }
 
   void reset_offboard_requests()
@@ -1163,6 +1195,13 @@ private:
   bool status_ready()
   {
     return have_status_ && (now() - last_status_time_).seconds() < msg_timeout_status_;
+  }
+
+  bool vehicle_land_detected_ready()
+  {
+    const double age = (now() - last_vehicle_land_detected_time_).seconds();
+    return last_vehicle_land_detected_time_.nanoseconds() != 0 &&
+      std::isfinite(age) && age >= 0.0 && age < msg_timeout_vehicle_land_detected_;
   }
 
   bool rc_control_available()
@@ -1352,6 +1391,16 @@ private:
       return;
     }
 
+    const std::string next_odom_frame_id =
+      msg->header.frame_id.empty() ? "world" : msg->header.frame_id;
+    const bool odom_frame_changed = have_odom_ && next_odom_frame_id != odom_frame_id_;
+    if (odom_frame_changed) {
+      RCLCPP_WARN(
+        get_logger(),
+        "[px4_ctrl_ros2] odometry frame changed from '%s' to '%s'",
+        odom_frame_id_.c_str(), next_odom_frame_id.c_str());
+    }
+
     const auto callback_time = now();
     if (last_nav_odom_callback_time_.nanoseconds() != 0) {
       nav_odom_last_gap_ = (callback_time - last_nav_odom_callback_time_).seconds();
@@ -1363,7 +1412,7 @@ private:
     const rclcpp::Time msg_time =
       msg->header.stamp.sec == 0 && msg->header.stamp.nanosec == 0 ?
       now() : rclcpp::Time(msg->header.stamp);
-    if (estimate_nav_odom_velocity_ && have_odom_) {
+    if (estimate_nav_odom_velocity_ && have_odom_ && !odom_frame_changed) {
       const double dt = (msg_time - last_nav_odom_stamp_).seconds();
       if (dt > kMinOdomDt) {
         v = (p - last_nav_odom_position_) / dt;
@@ -1378,7 +1427,7 @@ private:
     last_odom_time_ = callback_time;
     last_nav_odom_stamp_ = msg_time;
     last_nav_odom_position_ = p;
-    odom_frame_id_ = msg->header.frame_id.empty() ? "world" : msg->header.frame_id;
+    odom_frame_id_ = next_odom_frame_id;
     odom_child_frame_id_ = msg->child_frame_id.empty() ? "base_link" : msg->child_frame_id;
   }
 
@@ -1387,6 +1436,12 @@ private:
     vehicle_status_ = *msg;
     have_status_ = true;
     last_status_time_ = now();
+  }
+
+  void vehicle_land_detected_callback(const VehicleLandDetected::SharedPtr msg)
+  {
+    vehicle_land_detected_ = *msg;
+    last_vehicle_land_detected_time_ = now();
   }
 
   void manual_control_callback(const ManualControlSetpoint::SharedPtr msg)
@@ -1435,13 +1490,6 @@ private:
       have_battery_ = true;
       last_battery_time_ = now();
     }
-  }
-
-  void land_detected_callback(const VehicleLandDetected::SharedPtr msg)
-  {
-    land_detected_ = *msg;
-    have_land_detected_ = true;
-    last_land_detected_time_ = now();
   }
 
   void sensor_combined_callback(const SensorCombined::SharedPtr msg)
@@ -1569,7 +1617,7 @@ private:
       get_logger(),
       *get_clock(),
       1000,
-      "[px4_ctrl_ros2] detail: rc(mode=%.2f gear=%.2f hover=%s cmd=%s) | hover=(%.2f, %.2f, %.2f) stable=%s traj=%u/%u | ctrl(thr=%.2f thr2acc=%.2f acc_xy=%.2f pid_xy=%.2f vdes_xy=%.2f)",
+      "[px4_ctrl_ros2] detail: rc(mode=%.2f gear=%.2f hover=%s cmd=%s) | hover=(%.2f, %.2f, %.2f) stable=%s landed=%s traj=%u/%u | ctrl(thr=%.2f thr2acc=%.2f acc_xy=%.2f pid_xy=%.2f vdes_xy=%.2f)",
       rc_.mode,
       rc_.gear,
       yes_no(rc_.is_hover_mode),
@@ -1578,6 +1626,7 @@ private:
       hover_position_.y(),
       hover_position_.z(),
       yes_no(hover_stable_started_),
+      yes_no(land_detector_.landed),
       active_planner_traj_id_,
       completed_planner_traj_id_,
       controller_.debug().normalized_thrust,

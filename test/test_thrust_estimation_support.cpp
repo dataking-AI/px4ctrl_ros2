@@ -57,6 +57,21 @@ TEST(AttitudeSetpointPolicy, IgnoresYawRateFeedforward)
   EXPECT_FLOAT_EQ(0.0F, attitude_yaw_sp_move_rate());
 }
 
+TEST(HoverZSetpointPolicy, KeepsTheSetpointAboveTheWorldFrameFloor)
+{
+  EXPECT_DOUBLE_EQ(1.5, clamp_hover_z_setpoint(1.5));
+  EXPECT_DOUBLE_EQ(0.0, clamp_hover_z_setpoint(0.0));
+  EXPECT_DOUBLE_EQ(kMinHoverZSetpoint, clamp_hover_z_setpoint(-3.0));
+  EXPECT_DOUBLE_EQ(kMinHoverZSetpoint, clamp_hover_z_setpoint(-12.0));
+}
+
+TEST(HoverZSetpointPolicy, FallsBackToTheFloorForNonFiniteInput)
+{
+  EXPECT_DOUBLE_EQ(
+    kMinHoverZSetpoint,
+    clamp_hover_z_setpoint(std::numeric_limits<double>::quiet_NaN()));
+}
+
 TEST(AttitudeSetpointPolicy, AlignsNavWorldAttitudeToFcuWorldAttitude)
 {
   const Eigen::Quaterniond nav_attitude(
